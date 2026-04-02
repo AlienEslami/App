@@ -287,16 +287,15 @@ def solveHRP(data, y_buy, y_sell, y_cap, d_l, u_l, count):
         )
 
     def rule_obj(mod):
-        return (sum(mod.pho_plus[p]*mod.w_buy[t] 
-                    for p in mod.P for t in range(mod.Q_begin[p], mod.Q_end[p]))
+        return (sum(mod.PI[t]*mod.w_sell[t] for t in mod.T)
+              - sum(mod.PI[t]*mod.w_buy[t] for t in mod.T)
+              + sum(mod.PI_cap[t]*mod.w_cap[t] for t in mod.T)
+              + sum(mod.pho_plus[p]*mod.w_buy[t] 
+                    for p in mod.P for t in range(int(mod.Q_begin[p]), int(mod.Q_end[p])+1))
               - sum(mod.pho_minus[p]*mod.w_sell[t] 
-                    for p in mod.P for t in range(mod.Q_begin[p], mod.Q_end[p]))
-              + sum(mod.PI_cap[t]*mod.w_cap[t] 
-                    for t in mod.T)
+                    for p in mod.P for t in range(int(mod.Q_begin[p]), int(mod.Q_end[p])+1))
               - sum(mod.mi[p]*mod.w_cap[t] 
-                    for p in mod.P for t in range(mod.Q_begin[p], mod.Q_end[p]))
-              + sum(mod.PI[t]*mod.w_sell[t] for t in mod.T)
-              - sum(mod.PI[t]*mod.w_buy[t] for t in mod.T))
+                    for p in mod.P for t in range(int(mod.Q_begin[p]), int(mod.Q_end[p])+1)))
 
     model.obj = pyo.Objective(rule=rule_obj, sense=pyo.maximize)
 
