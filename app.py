@@ -287,14 +287,31 @@ def solveHRP(data, y_buy, y_sell, y_cap, d_l, u_l, count):
         )
 
     def rule_obj(mod):
-        return sum(mod.PI[t]*mod.w_buy[t] for t in mod.T)
+        return (sum(mod.PI[t]*mod.w_sell[t] for t in mod.T)
+              - sum(mod.PI[t]*mod.w_buy[t] for t in mod.T)
+              + sum(mod.PI_cap[t]*mod.w_cap[t] for t in mod.T)
+              + sum(mod.pho_plus[p]*mod.w_buy[t]
+                    for p in mod.P for t in range(int(pyo.value(mod.Q_begin[p])), int(pyo.value(mod.Q_end[p]))+1))
+              - sum(mod.pho_minus[p]*mod.w_sell[t]
+                    for p in mod.P for t in range(int(pyo.value(mod.Q_begin[p])), int(pyo.value(mod.Q_end[p]))+1))
+              - sum(mod.mi[p]*mod.w_cap[t]
+                    for p in mod.P for t in range(int(pyo.value(mod.Q_begin[p])), int(pyo.value(mod.Q_end[p]))+1)))
 
-    model.obj = pyo.Objective(rule=rule_obj, sense=pyo.minimize)
+    model.obj = pyo.Objective(rule=rule_obj, sense=pyo.maximize)
 
 
     print('Solving HRP')
     opt = pyo.SolverFactory('appsi_highs')
+    opt.config.load_solution = False
     results = opt.solve(model)
+    
+    if results.termination_condition in [
+        pyo.TerminationCondition.optimal,
+        pyo.TerminationCondition.feasible
+    ]:
+        model.solutions.load_from(results)
+    else:
+        print(f'HRP termination: {results.termination_condition}')
 
     return model
 
@@ -492,7 +509,16 @@ def solveLL(data, pho_plus, pho_minus, mi):
 
     print('Solving LL')
     opt = pyo.SolverFactory('appsi_highs')
+    opt.config.load_solution = False
     results = opt.solve(model, tee=True)
+    
+    if results.termination_condition in [
+        pyo.TerminationCondition.optimal,
+        pyo.TerminationCondition.feasible
+    ]:
+        model.solutions.load_from(results)
+    else:
+        print(f'LL termination: {results.termination_condition}')
 
     return model
 
