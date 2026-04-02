@@ -554,6 +554,8 @@ def optimize():
         return jsonify(result)
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()  # this prints full traceback to Railway logs
         return jsonify({"status": "error", "message": str(e)}), 500
 
 
