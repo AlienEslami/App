@@ -167,9 +167,9 @@ def solveHRP(data, y_buy, y_sell, y_cap, d_l, u_l, count):
     model.z = pyo.Var(model.K, model.N, model.T, domain=pyo.Binary)
     model.c = pyo.Var(model.K, model.T, domain=pyo.Binary)
     model.u = pyo.Var(model.L, domain=pyo.Binary)
-    model.pho_plus = pyo.Var(model.P, domain=pyo.NonNegativeIntegers)
-    model.pho_minus = pyo.Var(model.P, domain=pyo.NonNegativeIntegers)
-    model.mi = pyo.Var(model.P, domain=pyo.NonNegativeIntegers)
+    model.pho_plus = pyo.Var(model.P, domain=pyo.NonNegativeReals)
+    model.pho_minus = pyo.Var(model.P, domain=pyo.NonNegativeReals)
+    model.mi = pyo.Var(model.P, domain=pyo.NonNegativeReals)
     model.z_up = pyo.Var(model.K, model.N, model.T, domain=pyo.Binary)
     model.z_down = pyo.Var(model.K, model.N, model.T, domain=pyo.Binary)
 
