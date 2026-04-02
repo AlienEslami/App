@@ -10,11 +10,3 @@ RUN pip install glpk
 COPY . .
 
 CMD ["python", "app.py"]
-```
-
-And make sure your `requirements.txt` does **not** contain `glpk` — it should only have:
-```
-flask
-pyomo
-pandas
-openpyxl
