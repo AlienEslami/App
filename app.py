@@ -7,15 +7,49 @@ app = Flask(__name__)
 
 
 def build_dataframes(input_data):
+    buses = pd.DataFrame(input_data['buses']).rename(columns={'bus_kwh': 'Bus (kWh)'})
+    chargers = pd.DataFrame(input_data['chargers']).rename(columns={
+        'charger_kwhmin': 'Charger (kWh/min)',
+        'charger_kw': 'Charger (kW)',
+        'max_power_kw': 'Max Power (kW)'
+    })
+    trip_time = pd.DataFrame(input_data['trip_time']).rename(columns={
+        'time_begin_min': 'Time begin (min)',
+        'time_finish_min': 'Time finish (min)'
+    })
+    energy_consumption = pd.DataFrame(input_data['energy_consumption']).rename(columns={
+        'uncertain_energy_kwhkmmin': 'Uncertain energy (kWh/km*min)'
+    })
+    prices = pd.DataFrame(input_data['prices']).rename(columns={
+        'spot_market': 'Spot Market',
+        'capacity_price': 'Capacity price'
+    })
+    power_price = pd.DataFrame(input_data['power_price']).rename(columns={
+        'power': 'Power',
+        'price': 'Price'
+    })
+    average_prices = pd.DataFrame(input_data['average_prices']).rename(columns={
+        'max_price': 'Max price',
+        'min_price': 'Min price',
+        'max_cap': 'Max cap',
+        'min_cap': 'Min cap'
+    })
+    periods = pd.DataFrame(input_data['periods']).rename(columns={
+        'period': 'Period',
+        'begin': 'Begin',
+        'end': 'End',
+        'len': 'Len'
+    })
+
     return {
-        'Buses':              pd.DataFrame(input_data['buses']),
-        'Chargers':           pd.DataFrame(input_data['chargers']),
-        'Trip time':          pd.DataFrame(input_data['trip_time']),
-        'Energy consumption': pd.DataFrame(input_data['energy_consumption']),
-        'Prices':             pd.DataFrame(input_data['prices']),
-        'Power price':        pd.DataFrame(input_data['power_price']),
-        'Average prices':     pd.DataFrame(input_data['average_prices']),
-        'Periods':            pd.DataFrame(input_data['periods']),
+        'Buses': buses,
+        'Chargers': chargers,
+        'Trip time': trip_time,
+        'Energy consumption': energy_consumption,
+        'Prices': prices,
+        'Power price': power_price,
+        'Average prices': average_prices,
+        'Periods': periods,
     }
 
 
