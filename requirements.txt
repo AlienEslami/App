@@ -2,3 +2,7 @@ flask
 pyomo
 pandas
 openpyxl
+highspyflask
+pyomo
+pandas
+openpyxl
