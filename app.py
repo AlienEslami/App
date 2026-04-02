@@ -525,25 +525,3 @@ def optimize():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
-```
-
-And your `requirements.txt`:
-```
-flask
-pyomo
-pandas
-openpyxl
-highspy
-```
-
-And your `Dockerfile`:
-```
-FROM python:3.11-slim
-
-WORKDIR /app
-COPY requirements.txt .
-RUN pip install -r requirements.txt
-
-COPY . .
-
-CMD ["python", "app.py"]
