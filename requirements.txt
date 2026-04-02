@@ -2,4 +2,3 @@ flask
 pyomo
 pandas
 openpyxl
-glpk
