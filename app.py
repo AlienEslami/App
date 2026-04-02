@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify
 import pyomo.environ as pyo
-from pyomo.opt import SolverFactory
 import pandas as pd
 import os
 
@@ -8,7 +7,6 @@ app = Flask(__name__)
 
 
 def build_dataframes(input_data):
-    """Convert preprocessed JSON from n8n into DataFrames matching original data['SheetName'] structure"""
     return {
         'Buses':              pd.DataFrame(input_data['buses']),
         'Chargers':           pd.DataFrame(input_data['chargers']),
@@ -92,10 +90,10 @@ def solveHRP(data, y_buy, y_sell, y_cap, d_l, u_l, count):
     model.Q_len = pyo.Param(model.P, initialize=lambda model, p: Q_len[p-1])
     model.X_low = pyo.Param(model.P, initialize=lambda model, p: X_low[p-1])
     model.X_up = pyo.Param(model.P, initialize=lambda model, p: X_up[p-1])
-    model.X_avg = pyo.Param(initialize=(X_avg))
+    model.X_avg = pyo.Param(initialize=X_avg)
     model.Mi_low = pyo.Param(model.P, initialize=lambda model, p: Mi_low[p-1])
     model.Mi_up = pyo.Param(model.P, initialize=lambda model, p: Mi_up[p-1])
-    model.Mi_avg = pyo.Param(initialize=(Mi_avg))
+    model.Mi_avg = pyo.Param(initialize=Mi_avg)
     model.T_start = pyo.Param(model.I, initialize=lambda model, i: T_start[i-1])
     model.T_end = pyo.Param(model.I, initialize=lambda model, i: T_end[i-1])
     model.alpha = pyo.Param(model.N, initialize=lambda model, n: alpha[n-1])
@@ -210,7 +208,7 @@ def solveHRP(data, y_buy, y_sell, y_cap, d_l, u_l, count):
     for k in model.K:
         model.constraints.add(model.e[k, 1] == model.E_0*model.C_bat[k])
     for k in model.K:
-        model.constraints.add(model.e[k, T-1] + sum(model.ch_eff*model.alpha[n] * model.x[k, n, T] for n in model.N) >= model.E_end*model.C_bat[k])
+        model.constraints.add(model.e[k, T-1] + sum(model.ch_eff*model.alpha[n]*model.x[k, n, T] for n in model.N) >= model.E_end*model.C_bat[k])
     for k in model.K:
         for t in model.T:
             model.constraints.add(model.d[k, t] == ((model.R*model.C_bat[1]*1000)/(4*model.Ah*model.V)) * (sum(model.dch_eff*model.beta[n]*model.y[k, n, t] for n in model.N)))
@@ -265,7 +263,7 @@ def solveHRP(data, y_buy, y_sell, y_cap, d_l, u_l, count):
     model.obj = pyo.Objective(rule=rule_obj, sense=pyo.maximize)
 
     print('Solving HRP')
-    opt = pyo.SolverFactory('glpk', executable='/usr/bin/glpsol')
+    opt = pyo.SolverFactory('appsi_highs')
     results = opt.solve(model)
 
     return model
@@ -463,9 +461,7 @@ def solveLL(data, pho_plus, pho_minus, mi):
                 model.constraints.add(1 - model.z[k, n, t] + model.z[k, n, t-1] + ((1/(T-t+1))*sum(model.z[k, n, j] for j in range(t, T))) >= 1)
 
     print('Solving LL')
-    opt = pyo.SolverFactory('glpk')
-    opt.options['tmlim'] = 120
-    opt.options['mipgap'] = 0.005
+    opt = pyo.SolverFactory('appsi_highs')
     results = opt.solve(model, tee=True)
 
     return model
@@ -529,3 +525,25 @@ def optimize():
 
 if __name__ == '__main__':
     app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+```
+
+And your `requirements.txt`:
+```
+flask
+pyomo
+pandas
+openpyxl
+highspy
+```
+
+And your `Dockerfile`:
+```
+FROM python:3.11-slim
+
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install -r requirements.txt
+
+COPY . .
+
+CMD ["python", "app.py"]
