@@ -1,2 +1,6 @@
 [phases.setup]
 nixPkgs = ["glpk"]
+
+[phases.install]
+cmds = ["pip install -r requirements.txt", "pip install glpk"][phases.setup]
+nixPkgs = ["glpk"]
