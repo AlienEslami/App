@@ -265,7 +265,7 @@ def solveHRP(data, y_buy, y_sell, y_cap, d_l, u_l, count):
     model.obj = pyo.Objective(rule=rule_obj, sense=pyo.maximize)
 
     print('Solving HRP')
-    opt = pyo.SolverFactory('glpk')
+    opt = pyo.SolverFactory('glpk', executable='/usr/bin/glpsol')
     results = opt.solve(model)
 
     return model
