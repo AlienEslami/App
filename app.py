@@ -3,8 +3,13 @@ import pyomo.environ as pyo
 import pandas as pd
 import os
 import traceback
+import threading
+import uuid
 
 app = Flask(__name__)
+
+# In-memory job store
+jobs = {}
 
 # ==============================================================================
 # LLM HOOK - Replace this function body with LLM API call in the future
@@ -77,8 +82,7 @@ def build_dataframes(input_data):
 # HELPERS
 # ==============================================================================
 def extract_scalars(data):
-    """Extract and validate all scalar data needed by both solvers."""
-    T_steps = 24  # simplified: hourly timesteps instead of 96 (15-min)
+    T_steps = 24
     delta_t = 1
     M       = 10000
 
@@ -90,15 +94,14 @@ def extract_scalars(data):
     Q_end_raw   = [int(x) for x in data['Periods']['End'].tolist()]
     Q_len_raw   = [int(x) for x in data['Periods']['Len'].tolist()]
 
-    # Scale period boundaries to T_steps
-    scale = T_steps / 96.0
+    scale   = T_steps / 96.0
     Q_begin = [max(1, int(round(b * scale))) for b in Q_begin_raw]
     Q_end   = [min(T_steps, int(round(e * scale))) for e in Q_end_raw]
     Q_len   = [max(1, Q_end[i] - Q_begin[i] + 1) for i in range(p_count)]
 
-    k_count = min(3, len(data['Buses']['Bus (kWh)']))        # simplified: 3 buses
-    n_count = min(3, len(data['Chargers']['Charger (kWh/min)']))  # simplified: 3 chargers
-    i_count = min(3, len(data['Trip time']['Time begin (min)']))  # simplified: 3 trips
+    k_count = min(3, len(data['Buses']['Bus (kWh)']))
+    n_count = min(3, len(data['Chargers']['Charger (kWh/min)']))
+    i_count = min(3, len(data['Trip time']['Time begin (min)']))
     l_count = len(data['Power price']['Power'])
 
     C_bat   = data['Buses']['Bus (kWh)'].tolist()[:k_count]
@@ -110,12 +113,10 @@ def extract_scalars(data):
     U_max   = data['Chargers']['Max Power (kW)'].tolist()[0]
     U_cap   = 200
 
-    # Scale trip times to T_steps
     T_start_raw = [int(x) for x in data['Trip time']['Time begin (min)'].tolist()[:i_count]]
     T_end_raw   = [int(x) for x in data['Trip time']['Time finish (min)'].tolist()[:i_count]]
     T_start = [max(1, min(T_steps, int(round(t * scale)))) for t in T_start_raw]
     T_end   = [max(1, min(T_steps, int(round(t * scale)))) for t in T_end_raw]
-    # Ensure T_end > T_start
     T_end   = [max(T_start[i]+1, T_end[i]) for i in range(i_count)]
 
     return {
@@ -134,7 +135,6 @@ def extract_scalars(data):
 
 
 def get_period_timesteps(p_idx, Q_begin, Q_end, valid_T):
-    """Return list of valid timesteps for period p (0-indexed)."""
     return [t for t in range(Q_begin[p_idx], Q_end[p_idx]+1) if t in valid_T]
 
 
@@ -142,10 +142,6 @@ def get_period_timesteps(p_idx, Q_begin, Q_end, valid_T):
 # HPR SOLVER
 # ==============================================================================
 def solveHRP(sc, price_bounds, y_buy, y_sell, d_l, u_l, count):
-    """
-    sc: scalars dict from extract_scalars()
-    price_bounds: from get_high_level_prices()
-    """
     T_steps  = sc['T_steps']
     p_count  = sc['p_count']
     i_count  = sc['i_count']
@@ -189,7 +185,6 @@ def solveHRP(sc, price_bounds, y_buy, y_sell, d_l, u_l, count):
 
     model = pyo.ConcreteModel()
 
-    # Sets
     model.P = pyo.RangeSet(p_count)
     model.I = pyo.RangeSet(i_count)
     model.T = pyo.RangeSet(T_steps)
@@ -199,25 +194,23 @@ def solveHRP(sc, price_bounds, y_buy, y_sell, d_l, u_l, count):
 
     valid_T = set(range(1, T_steps+1))
 
-    # Parameters
-    model.PI     = pyo.Param(model.T, initialize=lambda m,t: PI[t-1])
-    model.PI_cap = pyo.Param(model.T, initialize=lambda m,t: PI_cap[t-1])
-    model.alpha  = pyo.Param(model.N, initialize=lambda m,n: alpha[n-1])
-    model.beta   = pyo.Param(model.N, initialize=lambda m,n: beta[n-1])
-    model.C_bat  = pyo.Param(model.K, initialize=lambda m,k: C_bat[k-1])
-    model.U_pow  = pyo.Param(model.L, initialize=lambda m,l: U_pow[l-1])
-    model.U_price= pyo.Param(model.L, initialize=lambda m,l: U_price[l-1])
-    model.gama   = pyo.Param(model.I, initialize=lambda m,i: gama[i-1])
-    model.X_low  = pyo.Param(model.P, initialize=lambda m,p: float(X_low[p-1]))
-    model.X_up   = pyo.Param(model.P, initialize=lambda m,p: float(X_up[p-1]))
-    model.Mi_low = pyo.Param(model.P, initialize=lambda m,p: float(Mi_low[p-1]))
-    model.Mi_up  = pyo.Param(model.P, initialize=lambda m,p: float(Mi_up[p-1]))
-    model.y_buy  = pyo.Param(model.T, initialize=y_buy)
-    model.y_sell = pyo.Param(model.T, initialize=y_sell)
-    model.d_l    = pyo.Param(model.K, model.T, initialize=d_l)
-    model.u_l    = pyo.Param(model.L, initialize=u_l)
+    model.PI      = pyo.Param(model.T, initialize=lambda m,t: PI[t-1])
+    model.PI_cap  = pyo.Param(model.T, initialize=lambda m,t: PI_cap[t-1])
+    model.alpha   = pyo.Param(model.N, initialize=lambda m,n: alpha[n-1])
+    model.beta    = pyo.Param(model.N, initialize=lambda m,n: beta[n-1])
+    model.C_bat   = pyo.Param(model.K, initialize=lambda m,k: C_bat[k-1])
+    model.U_pow   = pyo.Param(model.L, initialize=lambda m,l: U_pow[l-1])
+    model.U_price = pyo.Param(model.L, initialize=lambda m,l: U_price[l-1])
+    model.gama    = pyo.Param(model.I, initialize=lambda m,i: gama[i-1])
+    model.X_low   = pyo.Param(model.P, initialize=lambda m,p: float(X_low[p-1]))
+    model.X_up    = pyo.Param(model.P, initialize=lambda m,p: float(X_up[p-1]))
+    model.Mi_low  = pyo.Param(model.P, initialize=lambda m,p: float(Mi_low[p-1]))
+    model.Mi_up   = pyo.Param(model.P, initialize=lambda m,p: float(Mi_up[p-1]))
+    model.y_buy   = pyo.Param(model.T, initialize=y_buy)
+    model.y_sell  = pyo.Param(model.T, initialize=y_sell)
+    model.d_l     = pyo.Param(model.K, model.T, initialize=d_l)
+    model.u_l     = pyo.Param(model.L, initialize=u_l)
 
-    # Decision variables
     model.pho_plus  = pyo.Var(model.P, domain=pyo.NonNegativeReals)
     model.pho_minus = pyo.Var(model.P, domain=pyo.NonNegativeReals)
     model.mi        = pyo.Var(model.P, domain=pyo.NonNegativeReals)
@@ -230,37 +223,26 @@ def solveHRP(sc, price_bounds, y_buy, y_sell, d_l, u_l, count):
     model.y         = pyo.Var(model.K, model.N, model.T, domain=pyo.Binary)
     model.c         = pyo.Var(model.K, model.T, domain=pyo.Binary)
     model.u         = pyo.Var(model.L, domain=pyo.Binary)
-
-    # Linearization auxiliary variables
-    # q1[p,k,n,t] = pho_plus[p] * x[k,n,t]
-    # q2[p,k,n,t] = pho_minus[p] * y[k,n,t]
-    model.q1 = pyo.Var(model.P, model.K, model.N, model.T, within=pyo.NonNegativeReals)
-    model.q2 = pyo.Var(model.P, model.K, model.N, model.T, within=pyo.NonNegativeReals)
+    model.q1        = pyo.Var(model.P, model.K, model.N, model.T, within=pyo.NonNegativeReals)
+    model.q2        = pyo.Var(model.P, model.K, model.N, model.T, within=pyo.NonNegativeReals)
 
     model.constraints = pyo.ConstraintList()
 
-    # McCormick envelopes for q1, q2
     for p in model.P:
         rho_up = float(X_up[p-1])
-        rho_lo = float(X_low[p-1])
-        mu_up  = float(Mi_up[p-1])
         for k in model.K:
             for n in model.N:
                 for t in model.T:
-                    # q1 = pho_plus[p] * x[k,n,t]
                     model.constraints.add(model.q1[p,k,n,t] <= rho_up * model.x[k,n,t])
                     model.constraints.add(model.q1[p,k,n,t] <= model.pho_plus[p])
                     model.constraints.add(model.q1[p,k,n,t] >= model.pho_plus[p] - (1 - model.x[k,n,t]) * rho_up)
                     model.constraints.add(model.q1[p,k,n,t] >= 0)
-                    # q2 = pho_minus[p] * y[k,n,t]
                     model.constraints.add(model.q2[p,k,n,t] <= delta * rho_up * model.y[k,n,t])
                     model.constraints.add(model.q2[p,k,n,t] <= model.pho_minus[p])
                     model.constraints.add(model.q2[p,k,n,t] >= model.pho_minus[p] - (1 - model.y[k,n,t]) * delta * rho_up)
                     model.constraints.add(model.q2[p,k,n,t] >= 0)
 
-    # Linearized objective
     def rule_obj(mod):
-        # f1: energy trading with PTO
         f1_buy  = sum(ch_eff * mod.alpha[n] * mod.q1[p,k,n,t]
                       for p in mod.P
                       for t in get_period_timesteps(p-1, Q_begin, Q_end, valid_T)
@@ -269,13 +251,11 @@ def solveHRP(sc, price_bounds, y_buy, y_sell, d_l, u_l, count):
                       for p in mod.P
                       for t in get_period_timesteps(p-1, Q_begin, Q_end, valid_T)
                       for k in mod.K for n in mod.N)
-        # f3: spot market
         f3 = sum(mod.PI[t] * (mod.w_sell[t] - mod.w_buy[t]) for t in mod.T)
         return f1_buy - f1_sell + f3
 
     model.obj = pyo.Objective(rule=rule_obj, sense=pyo.maximize)
 
-    # Price constraints
     for p in model.P:
         model.constraints.add(model.pho_plus[p] >= model.X_low[p])
         model.constraints.add(model.pho_plus[p] <= model.X_up[p])
@@ -288,7 +268,6 @@ def solveHRP(sc, price_bounds, y_buy, y_sell, d_l, u_l, count):
     model.constraints.add(
         (1/T_steps) * sum(Q_len[p-1] * model.mi[p] for p in model.P) <= Mi_avg)
 
-    # Route constraints
     for k in model.K:
         for t in model.T:
             model.constraints.add(
@@ -301,11 +280,11 @@ def solveHRP(sc, price_bounds, y_buy, y_sell, d_l, u_l, count):
 
     for i in model.I:
         for k in model.K:
-            ts = [t for t in range(T_start[i-1], T_end[i-1]-1) if t in valid_T and t+1 in valid_T]
+            ts = [t for t in range(T_start[i-1], T_end[i-1]-1)
+                  if t in valid_T and t+1 in valid_T]
             for t in ts:
                 model.constraints.add(model.b[k,i,t+1] >= model.b[k,i,t])
 
-    # Charger constraints
     for n in model.N:
         for t in model.T:
             model.constraints.add(
@@ -318,7 +297,6 @@ def solveHRP(sc, price_bounds, y_buy, y_sell, d_l, u_l, count):
                 sum(model.x[k,n,t] for n in model.N)
               + sum(model.y[k,n,t] for n in model.N) <= model.c[k,t])
 
-    # Energy dynamics
     for k in model.K:
         model.constraints.add(model.e[k,1] == E_0 * C_bat[k-1])
         for t in range(2, T_steps+1):
@@ -328,7 +306,6 @@ def solveHRP(sc, price_bounds, y_buy, y_sell, d_l, u_l, count):
                 - sum(gama[i-1] * model.b[k,i,t] for i in model.I)
                 - sum(dch_eff * beta[n-1] * model.y[k,n,t] for n in model.N))
 
-    # Energy bought/sold
     for t in model.T:
         model.constraints.add(
             sum(ch_eff * alpha[n-1] * model.x[k,n,t]
@@ -337,22 +314,18 @@ def solveHRP(sc, price_bounds, y_buy, y_sell, d_l, u_l, count):
             sum(dch_eff * beta[n-1] * model.y[k,n,t]
                 for n in model.N for k in model.K) == model.w_sell[t])
 
-    # Battery bounds
     for k in model.K:
         for t in model.T:
             model.constraints.add(model.e[k,t] >= C_bat[k-1] * E_min)
             model.constraints.add(model.e[k,t] <= C_bat[k-1] * E_max)
-        model.constraints.add(
-            model.e[k, T_steps] >= E_end * C_bat[k-1])
+        model.constraints.add(model.e[k, T_steps] >= E_end * C_bat[k-1])
 
-    # Degradation
     for k in model.K:
         for t in model.T:
             model.constraints.add(
                 model.d[k,t] == ((R * C_bat[0] * 1000) / (4 * Ah * V))
                 * sum(dch_eff * beta[n-1] * model.y[k,n,t] for n in model.N))
 
-    # Power level
     model.constraints.add(sum(model.u[l] for l in model.L) == 1)
     for t in model.T:
         model.constraints.add(
@@ -362,7 +335,6 @@ def solveHRP(sc, price_bounds, y_buy, y_sell, d_l, u_l, count):
             sum(alpha[n-1] * model.x[k,n,t] for k in model.K for n in model.N)
             <= U_max)
 
-    # HPR constraint (from iteration 2 onwards)
     if count > 1:
         model.constraints.add(
             sum(ch_eff * alpha[n-1] * model.q1[p,k,n,t]
@@ -425,8 +397,6 @@ def solveLL(sc, pho_plus_vals, pho_minus_vals, mi_vals):
     R        = sc['R']
     Ah       = sc['Ah']
     V        = sc['V']
-    d_on     = sc['d_on']
-    d_off    = sc['d_off']
     M        = sc['M']
 
     valid_T = set(range(1, T_steps+1))
@@ -439,12 +409,12 @@ def solveLL(sc, pho_plus_vals, pho_minus_vals, mi_vals):
     model.N = pyo.RangeSet(n_count)
     model.L = pyo.RangeSet(l_count)
 
-    model.alpha   = pyo.Param(model.N, initialize=lambda m,n: alpha[n-1])
-    model.beta    = pyo.Param(model.N, initialize=lambda m,n: beta[n-1])
-    model.C_bat   = pyo.Param(model.K, initialize=lambda m,k: C_bat[k-1])
-    model.U_pow   = pyo.Param(model.L, initialize=lambda m,l: U_pow[l-1])
-    model.U_price = pyo.Param(model.L, initialize=lambda m,l: U_price[l-1])
-    model.gama    = pyo.Param(model.I, initialize=lambda m,i: gama[i-1])
+    model.alpha    = pyo.Param(model.N, initialize=lambda m,n: alpha[n-1])
+    model.beta     = pyo.Param(model.N, initialize=lambda m,n: beta[n-1])
+    model.C_bat    = pyo.Param(model.K, initialize=lambda m,k: C_bat[k-1])
+    model.U_pow    = pyo.Param(model.L, initialize=lambda m,l: U_pow[l-1])
+    model.U_price  = pyo.Param(model.L, initialize=lambda m,l: U_price[l-1])
+    model.gama     = pyo.Param(model.I, initialize=lambda m,i: gama[i-1])
     model.pho_plus  = pyo.Param(model.P, initialize=pho_plus_vals)
     model.pho_minus = pyo.Param(model.P, initialize=pho_minus_vals)
     model.mi        = pyo.Param(model.P, initialize=mi_vals)
@@ -460,7 +430,6 @@ def solveLL(sc, pho_plus_vals, pho_minus_vals, mi_vals):
     model.w_cap  = pyo.Var(model.T, within=pyo.NonNegativeReals)
     model.d      = pyo.Var(model.K, model.T, within=pyo.NonNegativeReals)
 
-    # LL objective: minimize DOC
     def rule_obj(mod):
         f4 = (sum(mod.pho_plus[p] * mod.w_buy[t]
                   for p in mod.P
@@ -476,10 +445,8 @@ def solveLL(sc, pho_plus_vals, pho_minus_vals, mi_vals):
         return f4 - f5 + f6
 
     model.obj = pyo.Objective(rule=rule_obj, sense=pyo.minimize)
-
     model.constraints = pyo.ConstraintList()
 
-    # Route constraints
     for k in model.K:
         for t in model.T:
             model.constraints.add(
@@ -497,7 +464,6 @@ def solveLL(sc, pho_plus_vals, pho_minus_vals, mi_vals):
             for t in ts:
                 model.constraints.add(model.b[k,i,t+1] >= model.b[k,i,t])
 
-    # Charger constraints
     for n in model.N:
         for t in model.T:
             model.constraints.add(
@@ -510,7 +476,6 @@ def solveLL(sc, pho_plus_vals, pho_minus_vals, mi_vals):
                 sum(model.x[k,n,t] for n in model.N)
               + sum(model.y[k,n,t] for n in model.N) <= model.c[k,t])
 
-    # Energy dynamics
     for k in model.K:
         model.constraints.add(model.e[k,1] == E_0 * C_bat[k-1])
         for t in range(2, T_steps+1):
@@ -528,25 +493,21 @@ def solveLL(sc, pho_plus_vals, pho_minus_vals, mi_vals):
             sum(dch_eff * beta[n-1] * model.y[k,n,t]
                 for n in model.N for k in model.K) == model.w_sell[t])
 
-    # Battery bounds
     for k in model.K:
         for t in model.T:
             model.constraints.add(model.e[k,t] >= C_bat[k-1] * E_min)
             model.constraints.add(model.e[k,t] <= C_bat[k-1] * E_max)
         model.constraints.add(model.e[k, T_steps] >= E_end * C_bat[k-1])
 
-    # Degradation
     for k in model.K:
         for t in model.T:
             model.constraints.add(
                 model.d[k,t] == ((R * C_bat[0] * 1000) / (4 * Ah * V))
                 * sum(dch_eff * beta[n-1] * model.y[k,n,t] for n in model.N))
 
-    # Reserve (simplified: w_cap = 0 for now)
     for t in model.T:
         model.constraints.add(model.w_cap[t] == 0)
 
-    # Power level
     model.constraints.add(sum(model.u[l] for l in model.L) == 1)
     for t in model.T:
         model.constraints.add(
@@ -570,12 +531,10 @@ def solveLL(sc, pho_plus_vals, pho_minus_vals, mi_vals):
 
 
 # ==============================================================================
-# FLASK ENDPOINT
+# OPTIMIZATION RUNNER (runs in background thread)
 # ==============================================================================
-@app.route('/optimize', methods=['POST'])
-def optimize():
+def run_optimization(job_id, input_data):
     try:
-        input_data = request.json['input']
         data = build_dataframes(input_data)
         price_bounds = get_high_level_prices(data)
         sc = extract_scalars(data)
@@ -585,20 +544,16 @@ def optimize():
         count   = 1
         epsilon = 0.0001
 
-        # Initial values for LL outputs (scalars = 0 means no previous solution)
-        y_buy_init  = {t: 0 for t in range(1, sc['T_steps']+1)}
-        y_sell_init = {t: 0 for t in range(1, sc['T_steps']+1)}
-        d_l_init    = {(k,t): 0
-                       for k in range(1, sc['k_count']+1)
-                       for t in range(1, sc['T_steps']+1)}
-        u_l_init    = {l: 0 for l in range(1, sc['l_count']+1)}
+        y_buy_l  = {t: 0 for t in range(1, sc['T_steps']+1)}
+        y_sell_l = {t: 0 for t in range(1, sc['T_steps']+1)}
+        d_l      = {(k,t): 0
+                    for k in range(1, sc['k_count']+1)
+                    for t in range(1, sc['T_steps']+1)}
+        u_l      = {l: 0 for l in range(1, sc['l_count']+1)}
 
-        y_buy_l  = y_buy_init
-        y_sell_l = y_sell_init
-        d_l      = d_l_init
-        u_l      = u_l_init
+        model_LL = None
 
-        while UB != LB:
+        while True:
             print(f'--- Iteration {count} ---')
 
             model_HRP = solveHRP(sc, price_bounds,
@@ -626,9 +581,8 @@ def optimize():
                         for l in range(1, sc['l_count']+1)}
 
             LL_obj = pyo.value(model_LL.obj)
-            LB_candidate = LL_obj
-            if LB_candidate > LB:
-                LB = LB_candidate
+            if LL_obj > LB:
+                LB = LL_obj
 
             print(f'UB={UB:.4f}, LB={LB:.4f}')
 
@@ -636,11 +590,11 @@ def optimize():
                 break
 
             count += 1
-            if count == 3:  # simplified: max 2 iterations
+            if count == 3:
                 break
 
         result = {
-            "status": "optimal",
+            "status": "complete",
             "iterations": count,
             "upper_bound": UB,
             "lower_bound": LB,
@@ -655,11 +609,51 @@ def optimize():
                         for t in range(1, sc['T_steps']+1)]
                        for k in range(1, sc['k_count']+1)],
         }
-        return jsonify(result)
+        jobs[job_id] = result
+
+    except Exception as e:
+        traceback.print_exc()
+        jobs[job_id] = {"status": "error", "message": str(e)}
+
+
+# ==============================================================================
+# FLASK ENDPOINTS
+# ==============================================================================
+@app.route('/optimize', methods=['POST'])
+def optimize():
+    try:
+        input_data = request.json['input']
+        job_id = str(uuid.uuid4())
+        jobs[job_id] = {"status": "running"}
+
+        thread = threading.Thread(
+            target=run_optimization,
+            args=(job_id, input_data)
+        )
+        thread.start()
+
+        return jsonify({"job_id": job_id, "status": "running"})
 
     except Exception as e:
         traceback.print_exc()
         return jsonify({"status": "error", "message": str(e)}), 500
+
+
+@app.route('/result/<job_id>', methods=['GET'])
+def get_result(job_id):
+    job = jobs.get(job_id)
+    if not job:
+        return jsonify({"status": "not_found"}), 404
+    return jsonify(job)
+
+
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({
+        "status": "ok",
+        "active_jobs": len([j for j in jobs.values() if j.get("status") == "running"]),
+        "total_jobs": len(jobs)
+    })
 
 
 if __name__ == '__main__':
