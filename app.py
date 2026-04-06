@@ -101,7 +101,7 @@ def solveHRP(data, price_bounds, y_buy, y_sell, y_cap, d_l, u_l, count):
     model = pyo.ConcreteModel()
 
     # --- Raw data ---
-    T_steps = 96
+    T_steps = 24
     delta_t = 4
     M = 10000
 
@@ -478,7 +478,7 @@ def solveLL(data, pho_plus, pho_minus, mi):
 
     model = pyo.ConcreteModel()
 
-    T_steps = 96
+    T_steps = 24
     delta_t = 4
     M = 10000
 
@@ -792,7 +792,7 @@ def optimize():
 
             print(f'UB={UB}, LB={LB}')
             k += 1
-            if k == 5:
+            if k == 2:
                 break
 
         result = {
