@@ -250,7 +250,7 @@ def solveHRP(sc, price_bounds, y_buy, y_sell, d_l, u_l, count):
     for i in model.I:
         ts = [t for t in range(T_start[i-1], T_end[i-1]) if t in valid_T]
         for t in ts:
-            model.constraints.add(sum(model.b[k,i,t] for k in model.K) == 1)
+            model.constraints.add(sum(model.b[k,i,t] for k in model.K) <= 1)
 
     for i in model.I:
         for k in model.K:
@@ -420,7 +420,7 @@ def solveLL(sc, pho_plus_vals, pho_minus_vals, mi_vals):
     for i in model.I:
         ts = [t for t in range(T_start[i-1], T_end[i-1]) if t in valid_T]
         for t in ts:
-            model.constraints.add(sum(model.b[k,i,t] for k in model.K) == 1)
+            model.constraints.add(sum(model.b[k,i,t] for k in model.K) <= 1)
 
     for i in model.I:
         for k in model.K:
