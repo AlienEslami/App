@@ -258,26 +258,31 @@ def solveHRP(data, price_bounds, y_buy, y_sell, y_cap, d_l, u_l, count):
 
     # --- Linearized objective (A7-A10 from paper) ---
     def rule_obj(mod):
-        # f1: energy trading with PTO (linearized)
         f1 = (sum(ch_eff * mod.alpha[n] * mod.q1[p,k,n,t]
-                  for p in mod.P for t in range(Q_begin[p-1], Q_end[p-1]+1)
+                  for p in mod.P 
+                  for t in range(Q_begin[p-1], Q_end[p-1]+1)
+                  if t in mod.T
                   for k in mod.K for n in mod.N)
             - sum((1/dch_eff) * mod.beta[n] * mod.q2[p,k,n,t]
-                  for p in mod.P for t in range(Q_begin[p-1], Q_end[p-1]+1)
+                  for p in mod.P 
+                  for t in range(Q_begin[p-1], Q_end[p-1]+1)
+                  if t in mod.T
                   for k in mod.K for n in mod.N))
-
-        # f2: reserve market (linearized)
+    
         f2 = (sum(mod.PI_cap[t] * mod.w_cap[t] for t in mod.T)
             - sum((1/dch_eff) * mod.beta[n] * mod.q3[p,k,n,t]
-                  for p in mod.P for t in range(Q_begin[p-1], Q_end[p-1]+1)
+                  for p in mod.P 
+                  for t in range(Q_begin[p-1], Q_end[p-1]+1)
+                  if t in mod.T
                   for k in mod.K for n in mod.N)
             - sum(ch_eff * mod.alpha[n] * mod.q4[p,k,n,t]
-                  for p in mod.P for t in range(Q_begin[p-1], Q_end[p-1]+1)
+                  for p in mod.P 
+                  for t in range(Q_begin[p-1], Q_end[p-1]+1)
+                  if t in mod.T
                   for k in mod.K for n in mod.N))
-
-        # f3: spot market trading
+    
         f3 = sum(mod.PI[t] * (mod.w_sell[t] - mod.w_buy[t]) for t in mod.T)
-
+    
         return f1 + f2 + f3
 
     model.obj = pyo.Objective(rule=rule_obj, sense=pyo.maximize)
