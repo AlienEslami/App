@@ -30,16 +30,16 @@ def get_job(job_id):
 
 
 # ==============================================================================
-# LLM HOOK - now accepts price_guidance from LLM
+# LLM HOOK - accepts price_guidance from LLM
 # ==============================================================================
 def get_high_level_prices(data, price_guidance={}):
     """
-    Price bounds come from the data (Google Sheets).
-    X_avg, Mi_avg, delta come from the LLM price guidance.
-    
+    Price bounds from Google Sheets data.
+    X_avg, Mi_avg, delta from LLM price guidance.
+
     FUTURE selfish/altruistic mode:
-    - Selfish: push X_avg higher, delta lower (aggregator favored)
-    - Altruistic: push X_avg lower, delta higher (PTO favored)
+    - Selfish:    push X_avg higher, delta lower  (aggregator favored)
+    - Altruistic: push X_avg lower,  delta higher (PTO favored)
     """
     X_up   = data['Average prices']['Max price'].values.flatten()
     X_low  = data['Average prices']['Min price'].values.flatten()
@@ -50,9 +50,9 @@ def get_high_level_prices(data, price_guidance={}):
         'X_low':  X_low,
         'Mi_up':  Mi_up,
         'Mi_low': Mi_low,
-        'X_avg':  price_guidance.get('X_avg', 0.12),
+        'X_avg':  price_guidance.get('X_avg',  0.12),
         'Mi_avg': price_guidance.get('Mi_avg', 0.015),
-        'delta':  price_guidance.get('delta', 0.8),
+        'delta':  price_guidance.get('delta',  0.8),
     }
 
 
@@ -103,7 +103,7 @@ def extract_scalars(data):
     PI     = data['Prices']['Spot Market'].values.flatten()[:T_steps]
     PI_cap = data['Prices']['Capacity price'].values.flatten()[:T_steps]
 
-    p_count = min(2, len(data['Periods']['Period']))
+    p_count     = min(2, len(data['Periods']['Period']))
     Q_begin_raw = [int(x) for x in data['Periods']['Begin'].tolist()[:p_count]]
     Q_end_raw   = [int(x) for x in data['Periods']['End'].tolist()[:p_count]]
 
@@ -120,13 +120,16 @@ def extract_scalars(data):
     C_bat   = data['Buses']['Bus (kWh)'].tolist()[:k_count]
     alpha   = data['Chargers']['Charger (kWh/min)'].tolist()[:n_count]
     beta    = data['Chargers']['Charger (kWh/min)'].tolist()[:n_count]
-    gama    = data['Energy consumption']['Uncertain energy (kWh/km*min)'].tolist()[:i_count]
+    gama    = data['Energy consumption'][
+                  'Uncertain energy (kWh/km*min)'].tolist()[:i_count]
     U_pow   = data['Power price']['Power'].tolist()[:l_count]
     U_price = data['Power price']['Price'].tolist()[:l_count]
     U_max   = data['Chargers']['Max Power (kW)'].tolist()[0]
 
-    T_start_raw = [int(x) for x in data['Trip time']['Time begin (min)'].tolist()[:i_count]]
-    T_end_raw   = [int(x) for x in data['Trip time']['Time finish (min)'].tolist()[:i_count]]
+    T_start_raw = [int(x) for x in
+                   data['Trip time']['Time begin (min)'].tolist()[:i_count]]
+    T_end_raw   = [int(x) for x in
+                   data['Trip time']['Time finish (min)'].tolist()[:i_count]]
     T_start = [max(1, min(T_steps, int(round(t * scale)))) for t in T_start_raw]
     T_end   = [max(1, min(T_steps, int(round(t * scale)))) for t in T_end_raw]
     T_end   = [max(T_start[i]+1, T_end[i]) for i in range(i_count)]
@@ -134,8 +137,10 @@ def extract_scalars(data):
     return {
         'T_steps': T_steps, 'M': M,
         'PI': PI, 'PI_cap': PI_cap,
-        'p_count': p_count, 'Q_begin': Q_begin, 'Q_end': Q_end, 'Q_len': Q_len,
-        'k_count': k_count, 'n_count': n_count, 'i_count': i_count, 'l_count': l_count,
+        'p_count': p_count,
+        'Q_begin': Q_begin, 'Q_end': Q_end, 'Q_len': Q_len,
+        'k_count': k_count, 'n_count': n_count,
+        'i_count': i_count, 'l_count': l_count,
         'C_bat': C_bat, 'alpha': alpha, 'beta': beta, 'gama': gama,
         'U_pow': U_pow, 'U_price': U_price, 'U_max': U_max,
         'T_start': T_start, 'T_end': T_end,
@@ -148,6 +153,43 @@ def extract_scalars(data):
 
 def get_period_timesteps(p_idx, Q_begin, Q_end, valid_T):
     return [t for t in range(Q_begin[p_idx], Q_end[p_idx]+1) if t in valid_T]
+
+
+def apply_disturbances(sc, disturbances):
+    """Adjust trip times based on active disturbances."""
+    if not disturbances:
+        return sc
+
+    T_start = list(sc['T_start'])
+    T_end   = list(sc['T_end'])
+    scale   = sc['T_steps'] / 96.0
+
+    for d in disturbances:
+        try:
+            bus_id = int(d.get('bus_id', 0)) - 1
+            delay  = int(d.get('delay_minutes', 0))
+            d_type = d.get('disturbance_type', '')
+
+            if bus_id < 0 or bus_id >= len(T_start):
+                continue
+
+            delay_scaled = int(round(delay * scale / 15))
+
+            if d_type in ['late', 'breakdown']:
+                T_start[bus_id] = min(sc['T_steps'],
+                                      T_start[bus_id] + delay_scaled)
+                T_end[bus_id]   = min(sc['T_steps'],
+                                      T_end[bus_id] + delay_scaled)
+            elif d_type == 'early_return':
+                T_end[bus_id] = max(T_start[bus_id] + 1,
+                                    T_end[bus_id] - delay_scaled)
+        except Exception as e:
+            print(f'Error applying disturbance {d}: {e}')
+            continue
+
+    sc['T_start'] = T_start
+    sc['T_end']   = T_end
+    return sc
 
 
 # ==============================================================================
@@ -206,10 +248,14 @@ def solveHRP(sc, price_bounds, y_buy, y_sell, d_l, u_l, count):
     model.U_pow   = pyo.Param(model.L, initialize=lambda m,l: U_pow[l-1])
     model.U_price = pyo.Param(model.L, initialize=lambda m,l: U_price[l-1])
     model.gama    = pyo.Param(model.I, initialize=lambda m,i: gama[i-1])
-    model.X_low   = pyo.Param(model.P, initialize=lambda m,p: float(X_low[p-1]))
-    model.X_up    = pyo.Param(model.P, initialize=lambda m,p: float(X_up[p-1]))
-    model.Mi_low  = pyo.Param(model.P, initialize=lambda m,p: float(Mi_low[p-1]))
-    model.Mi_up   = pyo.Param(model.P, initialize=lambda m,p: float(Mi_up[p-1]))
+    model.X_low   = pyo.Param(model.P,
+                               initialize=lambda m,p: float(X_low[p-1]))
+    model.X_up    = pyo.Param(model.P,
+                               initialize=lambda m,p: float(X_up[p-1]))
+    model.Mi_low  = pyo.Param(model.P,
+                               initialize=lambda m,p: float(Mi_low[p-1]))
+    model.Mi_up   = pyo.Param(model.P,
+                               initialize=lambda m,p: float(Mi_up[p-1]))
     model.y_buy   = pyo.Param(model.T, initialize=y_buy)
     model.y_sell  = pyo.Param(model.T, initialize=y_sell)
     model.d_l     = pyo.Param(model.K, model.T, initialize=d_l)
@@ -244,16 +290,16 @@ def solveHRP(sc, price_bounds, y_buy, y_sell, d_l, u_l, count):
                     model.constraints.add(
                         model.q1[p,k,n,t] <= model.pho_plus[p])
                     model.constraints.add(
-                        model.q1[p,k,n,t] >= model.pho_plus[p] -
-                        (1 - model.x[k,n,t]) * rho_up)
+                        model.q1[p,k,n,t] >= model.pho_plus[p]
+                        - (1 - model.x[k,n,t]) * rho_up)
                     model.constraints.add(model.q1[p,k,n,t] >= 0)
                     model.constraints.add(
                         model.q2[p,k,n,t] <= delta * rho_up * model.y[k,n,t])
                     model.constraints.add(
                         model.q2[p,k,n,t] <= model.pho_minus[p])
                     model.constraints.add(
-                        model.q2[p,k,n,t] >= model.pho_minus[p] -
-                        (1 - model.y[k,n,t]) * delta * rho_up)
+                        model.q2[p,k,n,t] >= model.pho_minus[p]
+                        - (1 - model.y[k,n,t]) * delta * rho_up)
                     model.constraints.add(model.q2[p,k,n,t] >= 0)
 
     def rule_obj(mod):
@@ -375,7 +421,7 @@ def solveHRP(sc, price_bounds, y_buy, y_sell, d_l, u_l, count):
     print('Solving HRP')
     opt = pyo.SolverFactory('appsi_highs')
     results = opt.solve(model)
-    print(f'HRP done')
+    print('HRP done')
     return model
 
 
@@ -527,18 +573,19 @@ def solveLL(sc, pho_plus_vals, pho_minus_vals, mi_vals):
     print('Solving LL')
     opt = pyo.SolverFactory('appsi_highs')
     results = opt.solve(model)
-    print(f'LL done')
+    print('LL done')
     return model
 
 
 # ==============================================================================
 # OPTIMIZATION RUNNER
 # ==============================================================================
-def run_optimization(job_id, input_data, price_guidance={}):
+def run_optimization(job_id, input_data, price_guidance={}, disturbances=[]):
     try:
         print(f'Job {job_id} started')
+        print(f'Price guidance: {price_guidance}')
+        print(f'Disturbances: {disturbances}')
 
-        # Comment out the mock and uncomment real optimization when ready
         # --- MOCK (fast, for testing) ---
         time.sleep(5)
         result = {
@@ -547,6 +594,7 @@ def run_optimization(job_id, input_data, price_guidance={}):
             "upper_bound": 42.5,
             "lower_bound": 38.2,
             "price_guidance_used": price_guidance,
+            "disturbances_applied": disturbances,
             "pho_plus":  [0.095, 0.102],
             "pho_minus": [0.076, 0.082],
             "mi":        [0.009, 0.011],
@@ -563,6 +611,9 @@ def run_optimization(job_id, input_data, price_guidance={}):
         # data = build_dataframes(input_data)
         # price_bounds = get_high_level_prices(data, price_guidance)
         # sc = extract_scalars(data)
+        # if disturbances:
+        #     sc = apply_disturbances(sc, disturbances)
+        #     print(f'Applied {len(disturbances)} disturbances')
         # UB = float('inf')
         # LB = float('-inf')
         # count = 1
@@ -609,6 +660,7 @@ def run_optimization(job_id, input_data, price_guidance={}):
         #     "upper_bound": float(UB),
         #     "lower_bound": float(LB),
         #     "price_guidance_used": price_guidance,
+        #     "disturbances_applied": disturbances,
         #     "pho_plus":  [float(v) for v in pho_plus_vals.values()],
         #     "pho_minus": [float(v) for v in pho_minus_vals.values()],
         #     "mi":        [float(v) for v in mi_vals.values()],
@@ -635,13 +687,14 @@ def run_optimization(job_id, input_data, price_guidance={}):
 @app.route('/optimize', methods=['POST'])
 def optimize():
     try:
-        input_data = request.json['input']
+        input_data     = request.json['input']
         price_guidance = request.json.get('price_guidance', {})
+        disturbances   = request.json.get('disturbances', [])
         job_id = str(uuid.uuid4())
         save_job(job_id, {"status": "running"})
         threading.Thread(
             target=run_optimization,
-            args=(job_id, input_data, price_guidance)
+            args=(job_id, input_data, price_guidance, disturbances)
         ).start()
         return jsonify({"job_id": job_id, "status": "running"})
     except Exception as e:
