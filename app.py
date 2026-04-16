@@ -78,8 +78,7 @@ def build_dataframes(input_data):
         })
     chargers = pd.DataFrame(input_data['chargers']).rename(columns={
         'charger_kwhmin': 'Charger (kWh/min)',
-        'charger_kw':     'Charger (kW)',
-        'max_power_kw':   'Max Power (kW)'})
+        'charger_kw':     'Charger (kW)'})
     trip_time = trip_source.rename(columns={
         'time_begin_min':  'Time begin (min)',
         'time_finish_min': 'Time finish (min)',
@@ -137,7 +136,7 @@ def parse_time_to_step(value, timestep_minutes, full_horizon_steps, is_end=False
         total_minutes = (int(hour_text) * 60) + int(minute_text)
         step_value = total_minutes / float(timestep_minutes)
         if is_end:
-            step = int(step_value) if step_value.is_integer() else int(step_value) + 1
+            step = int(step_value) + 1 if step_value.is_integer() else int(step_value) + 2
         else:
             step = int(step_value) + 1
         return max(1, min(full_horizon_steps, step))
@@ -150,7 +149,7 @@ def parse_time_to_step(value, timestep_minutes, full_horizon_steps, is_end=False
         total_minutes = numeric * 60.0
         step_value = total_minutes / float(timestep_minutes)
         if is_end:
-            step = int(step_value) if step_value.is_integer() else int(step_value) + 1
+            step = int(step_value) + 1 if step_value.is_integer() else int(step_value) + 2
         else:
             step = int(step_value) + 1
         return max(1, min(full_horizon_steps, step))
@@ -195,6 +194,63 @@ def get_speed_km_per_hour_series(energy_consumption, count):
                 for value in values
             ]
     return [12.0] * count
+
+
+def get_duration_steps(start_value, end_value, timestep_minutes):
+    if pd.isna(start_value) or pd.isna(end_value):
+        raise ValueError('Trip time values cannot be empty')
+
+    start_text = str(start_value).strip()
+    end_text = str(end_value).strip()
+
+    if ':' in start_text and ':' in end_text:
+        start_hour, start_minute = start_text.split(':', 1)
+        end_hour, end_minute = end_text.split(':', 1)
+        start_total = (int(start_hour) * 60) + int(start_minute)
+        end_total = (int(end_hour) * 60) + int(end_minute)
+        if end_total < start_total:
+            raise ValueError('Trip end time cannot be earlier than start time')
+        duration_steps = (end_total - start_total) / float(timestep_minutes)
+        if not duration_steps.is_integer():
+            raise ValueError(
+                f'Trip duration {start_text} -> {end_text} is not aligned '
+                f'to the timestep of {timestep_minutes} minutes')
+        return int(duration_steps)
+
+    start_numeric = float(start_value)
+    end_numeric = float(end_value)
+    duration_steps = end_numeric - start_numeric
+    if duration_steps < 0:
+        raise ValueError('Trip end time cannot be earlier than start time')
+    if not float(duration_steps).is_integer():
+        raise ValueError('Trip duration must align with the model timestep')
+    return int(duration_steps)
+
+
+def validate_timestep_consistency(data, timestep_minutes, alpha, charger_kw,
+                                  energy_per_step, start_column, end_column,
+                                  T_start_raw, T_end_raw):
+    expected_alpha = [float(value) * (timestep_minutes / 60.0) for value in charger_kw]
+    for idx, (actual_alpha, expected) in enumerate(zip(alpha, expected_alpha), start=1):
+        if abs(actual_alpha - expected) > 1e-9:
+            raise ValueError(
+                f'Charger {idx} energy-per-step mismatch: expected {expected}, '
+                f'got {actual_alpha}')
+
+    trip_time = data['Trip time']
+    raw_starts = trip_time[start_column].tolist()[:len(T_start_raw)]
+    raw_ends = trip_time[end_column].tolist()[:len(T_end_raw)]
+    for idx, (start_value, end_value, modeled_start, modeled_end, step_energy) in enumerate(
+        zip(raw_starts, raw_ends, T_start_raw, T_end_raw, energy_per_step), start=1
+    ):
+        expected_steps = get_duration_steps(start_value, end_value, timestep_minutes)
+        modeled_steps = modeled_end - modeled_start
+        if expected_steps != modeled_steps:
+            raise ValueError(
+                f'Trip {idx} duration mismatch: input gives {expected_steps} steps, '
+                f'model maps to {modeled_steps} steps')
+        if step_energy <= 0:
+            raise ValueError(f'Trip {idx} must have positive energy consumption per step')
 
 
 def extract_realtime_state(data, current_timestep):
@@ -356,8 +412,7 @@ def extract_scalars(data, price_guidance=None, optimization_mode='day_ahead',
             energy_series.tolist()[:i_count], avg_speed_km_hour)
     ]
 
-    U_max_kw = float(pd.to_numeric(
-        data['Chargers']['Max Power (kW)'], errors='coerce').dropna().iloc[0])
+    U_max_kw = sum(charger_kw)  # site cap = sum of all charger ratings
     U_max = U_max_kw * timestep_hours
 
     # ── Trip times ──────────────────────────────────────────────────────────
@@ -375,6 +430,18 @@ def extract_scalars(data, price_guidance=None, optimization_mode='day_ahead',
         parse_time_to_step(value, timestep_minutes, full_horizon_steps, is_end=True)
         for value in data['Trip time'][end_column].tolist()[:i_count]
     ]
+
+    validate_timestep_consistency(
+        data,
+        timestep_minutes,
+        alpha,
+        charger_kw,
+        gama,
+        start_column,
+        end_column,
+        T_start_raw,
+        T_end_raw,
+    )
 
     if optimization_mode == 'real_time':
         delay_steps = [0] * i_count
@@ -658,9 +725,7 @@ def solvePTO(sc):
     for k in model.K:
         for t in model.T:
             model.constraints.add(model.e[k,t] >= C_bat[k-1] * E_min)
-            model.constraints.add(
-                E_max * C_bat[k-1] >= model.e[k,t]
-                + sum(ch_eff * alpha[n-1] * model.x[k,n,t] for n in model.N))
+            model.constraints.add(model.e[k,t] <= E_max * C_bat[k-1])
 
     # ── Constraint 12: end-of-day minimum SOC ────────────────────────────
     for k in model.K:
