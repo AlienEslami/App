@@ -40,7 +40,32 @@ def load_settings(workbook_path: Path) -> dict:
     return settings
 
 
-def build_input_data(workbook_path: Path) -> tuple[dict, dict]:
+def load_first_available_sheet_records(workbook_path: Path, sheet_names: list[str]) -> list[dict]:
+    workbook = load_workbook(workbook_path, data_only=True)
+    for sheet_name in sheet_names:
+        if sheet_name in workbook.sheetnames:
+            worksheet = workbook[sheet_name]
+            rows = list(worksheet.iter_rows(values_only=True))
+            if not rows:
+                return []
+            headers = [str(cell).strip() if cell is not None else "" for cell in rows[0]]
+            records = []
+            for row in rows[1:]:
+                if row is None or all(cell in (None, "") for cell in row):
+                    continue
+                record = {}
+                for idx, header in enumerate(headers):
+                    if not header:
+                        continue
+                    record[header] = row[idx] if idx < len(row) else None
+                records.append(record)
+            return records
+    raise ValueError(
+        f"None of the expected sheets {sheet_names} were found in {workbook_path}")
+
+
+def build_input_data(workbook_path: Path, spot_prices_path: Path | None = None,
+                     tariffs_path: Path | None = None) -> tuple[dict, dict]:
     settings = load_settings(workbook_path)
     trips = [
         row for row in load_sheet_records(workbook_path, "Trips")
@@ -48,12 +73,27 @@ def build_input_data(workbook_path: Path) -> tuple[dict, dict]:
         and row.get("time_end") not in (None, "")
         and row.get("energy_kwhkm") not in (None, "")
     ]
+    spot_source_path = spot_prices_path if spot_prices_path else workbook_path
+    spot_prices = load_first_available_sheet_records(
+        spot_source_path, ["Spot Prices", "Prices"])
+
+    tariffs = []
+    if tariffs_path:
+        tariffs = load_first_available_sheet_records(tariffs_path, ["Tariffs", "Prices"])
+    else:
+        workbook = load_workbook(workbook_path, data_only=True)
+        if "Tariffs" in workbook.sheetnames:
+            tariffs = load_sheet_records(workbook_path, "Tariffs")
+
     input_data = {
         "timestep_minutes": settings.get("timestep_minutes"),
+        "v2g_enabled": settings.get("v2g_enabled"),
         "buses": load_sheet_records(workbook_path, "Buses"),
         "chargers": load_sheet_records(workbook_path, "Chargers"),
         "trip_time": trips,
-        "prices": load_sheet_records(workbook_path, "Prices"),
+        "prices": spot_prices,
+        "grid_prices": spot_prices,
+        "tariffs": tariffs,
         "realtime_state": load_sheet_records(workbook_path, "Realtime state"),
     }
     return input_data, settings
@@ -150,8 +190,14 @@ def write_benchmark_action_sheet(workbook, sc: dict, model, timestep: int) -> No
         ])
 
 
-def generate_benchmark_files(template_path: Path, output_dir: Path) -> Path:
-    input_data, settings = build_input_data(template_path)
+def generate_benchmark_files(template_path: Path, output_dir: Path,
+                             spot_prices_path: Path | None = None,
+                             tariffs_path: Path | None = None) -> Path:
+    input_data, settings = build_input_data(
+        template_path,
+        spot_prices_path=spot_prices_path,
+        tariffs_path=tariffs_path,
+    )
     price_guidance = {}
     data = build_dataframes(input_data)
     sc = extract_scalars(
@@ -204,11 +250,26 @@ def main() -> None:
         default="Files/day_ahead_benchmark",
         help="Folder where the 48 benchmark workbooks will be written.",
     )
+    parser.add_argument(
+        "--spot-prices-file",
+        default="",
+        help="Optional Excel file containing spot prices (sheet 'Spot Prices' or 'Prices').",
+    )
+    parser.add_argument(
+        "--tariffs-file",
+        default="",
+        help="Optional Excel file containing buy/sell tariffs (sheet 'Tariffs' or 'Prices').",
+    )
     args = parser.parse_args()
+
+    spot_prices_path = Path(args.spot_prices_file) if args.spot_prices_file else None
+    tariffs_path = Path(args.tariffs_file) if args.tariffs_file else None
 
     output_dir = generate_benchmark_files(
         template_path=Path(args.input),
         output_dir=Path(args.output_dir),
+        spot_prices_path=spot_prices_path,
+        tariffs_path=tariffs_path,
     )
     print(f"Generated benchmark files in {output_dir}")
 
