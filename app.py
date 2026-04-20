@@ -56,6 +56,7 @@ MOCK_RESULT = {
     "total_sell_revenue":    None,
     "total_kwh_sold":        None,
     "total_kwh_bought":      None,
+    "multipliers_rescaled":  False,
     "w_buy":                 [],
     "w_sell":                [],
     "energy":                [],
@@ -301,67 +302,90 @@ def extract_scalars(data, price_guidance=None, optimization_mode='day_ahead',
     if T_steps <= 0:
         raise ValueError('No optimization horizon remains after applying current_timestep')
 
-    avg_P   = sum(P) / len(P)
+    avg_P = sum(P) / len(P)
 
     mode = price_guidance.get('mode', 'altruistic')
 
-    # ── Period boundaries — divide day into 3 equal parts ──────────────────
+    # ── Period boundaries — divide remaining steps into 3 equal parts ──────
     default_boundaries = [T_steps // 3, (T_steps * 2) // 3, T_steps]
     boundaries = price_guidance.get('period_boundaries', default_boundaries)
-    # Ensure last boundary covers full T_steps
+    # Ensure last boundary always covers full T_steps
     boundaries[-1] = T_steps
 
     # ── Read raw multipliers from price guidance ────────────────────────────
     buy_mults_raw  = price_guidance.get('buy_multipliers',  [1.05, 1.10, 1.05])
     sell_mults_raw = price_guidance.get('sell_multipliers', [0.80, 0.85, 0.80])
-    # ── Step 1: clip individual multipliers ─────────────────────────────────
+
+    # ── Step 1: hard clip individual multipliers (always enforced) ──────────
     buy_multipliers  = [max(1.01, min(1.50, float(m))) for m in buy_mults_raw]
     sell_multipliers = [max(0.40, min(0.99, float(m))) for m in sell_mults_raw]
 
-    # ── Step 2: enforce average buy multiplier (eq 7 analog from paper) ─────
-    # eq 7 analog: average buy price EBA charges PTO ≈ average grid price
-    # Multiplier average should stay close to 1.0
-    # Allow small tolerance: selfish can go up to 1.05, altruistic up to 1.02
-    TARGET_AVG_BUY = 1.05   # selfish: small average premium allowed
-    TARGET_AVG_ALT = 1.02   # altruistic: essentially pass-through pricing
+    # Track whether any rescaling occurred for downstream reporting
+    multipliers_rescaled = False
 
-    target = TARGET_AVG_BUY if mode == 'selfish' else TARGET_AVG_ALT
+    # ── Step 2: enforce average buy multiplier cap (day_ahead only) ─────────
+    # In real_time mode, the Pricing Agent targets specific timestep windows
+    # and period averages are not meaningful — skip enforcement entirely.
+    # In day_ahead mode:
+    #   SELFISH:    average buy cap = 1.20 (allows meaningful arbitrage margin)
+    #   ALTRUISTIC: average buy cap = 1.02 (near pass-through, minimise PTO cost)
+    if optimization_mode == 'day_ahead':
+        TARGET_AVG_BUY = 1.20   # selfish: moderate arbitrage margin
+        TARGET_AVG_ALT = 1.02   # altruistic: essentially pass-through pricing
 
-    actual_avg_buy = sum(buy_multipliers) / len(buy_multipliers)
-    if actual_avg_buy > target:
-        scale = target / actual_avg_buy
-        buy_multipliers = [max(1.01, m * scale) for m in buy_multipliers]
-        print(f'Buy multipliers rescaled: avg was {actual_avg_buy:.4f}, '
-              f'now {sum(buy_multipliers)/len(buy_multipliers):.4f}')
+        target = TARGET_AVG_BUY if mode == 'selfish' else TARGET_AVG_ALT
+        actual_avg_buy = sum(buy_multipliers) / len(buy_multipliers)
 
-    # ── Step 3: enforce sell multipliers stay below buy multipliers ──────────
-    # S_sell[t] must always be less than S_buy[t] (EBA can't pay more than it charges)
-    # and less than P[t] (EBA must profit on V2G resale)
-    # δ relationship from paper: ρ^- = δ × ρ^+ (sell is fraction of buy)
-    # We enforce this per-period
+        if actual_avg_buy > target:
+            scale = target / actual_avg_buy
+            buy_multipliers = [max(1.01, m * scale) for m in buy_multipliers]
+            multipliers_rescaled = True
+            print(f'[day_ahead] Buy multipliers rescaled: avg was {actual_avg_buy:.4f}, '
+                  f'now {sum(buy_multipliers)/len(buy_multipliers):.4f} '
+                  f'(target={target}, mode={mode})')
+        else:
+            print(f'[day_ahead] Buy multipliers within target: avg={actual_avg_buy:.4f} '
+                  f'<= {target} (mode={mode})')
+    else:
+        print(f'[real_time] Skipping average buy cap — period averages not enforced in real-time')
+
+    # ── Step 3: enforce sell < buy per period (always enforced) ─────────────
+    # EBA must always charge PTO more than it pays for V2G in the same period.
     sell_multipliers = [
-        min(sell_multipliers[i], buy_multipliers[i] - 0.01)  # sell < buy always
+        min(sell_multipliers[i], buy_multipliers[i] - 0.01)
         for i in range(len(sell_multipliers))
     ]
 
-    # ── Step 4: enforce average sell multiplier ──────────────────────────────
-    # Average sell price EBA pays PTO should not be below a floor
-    # (prevents EBA from paying almost nothing for V2G — unrealistic)
-    # Floor: sell average must be at least 0.60 × buy average
-    avg_buy  = sum(buy_multipliers)  / len(buy_multipliers)
-    avg_sell = sum(sell_multipliers) / len(sell_multipliers)
-    SELL_FLOOR_RATIO = 0.60
-    if avg_sell < avg_buy * SELL_FLOOR_RATIO:
-        scale_up = (avg_buy * SELL_FLOOR_RATIO) / avg_sell
-        sell_multipliers = [min(m * scale_up, buy_multipliers[i] - 0.01)
-                            for i, m in enumerate(sell_multipliers)]
-        print(f'Sell multipliers rescaled up: avg was {avg_sell:.4f}, '
-              f'now {sum(sell_multipliers)/len(sell_multipliers):.4f}')
+    # ── Step 4: enforce sell floor ratio (day_ahead only) ───────────────────
+    # In real_time mode, the Pricing Agent may legitimately set low sell
+    # multipliers in specific periods (e.g. suppress V2G during trips).
+    # In day_ahead mode, prevent sell average from falling below 60% of buy
+    # average to ensure V2G remains economically viable across the day.
+    if optimization_mode == 'day_ahead':
+        SELL_FLOOR_RATIO = 0.60
+        avg_buy  = sum(buy_multipliers)  / len(buy_multipliers)
+        avg_sell = sum(sell_multipliers) / len(sell_multipliers)
 
-    print(f'Final buy_multipliers={[round(m,4) for m in buy_multipliers]}, '
+        if avg_sell < avg_buy * SELL_FLOOR_RATIO:
+            scale_up = (avg_buy * SELL_FLOOR_RATIO) / avg_sell
+            sell_multipliers = [
+                min(m * scale_up, buy_multipliers[i] - 0.01)
+                for i, m in enumerate(sell_multipliers)
+            ]
+            multipliers_rescaled = True
+            print(f'[day_ahead] Sell multipliers rescaled up: avg was {avg_sell:.4f}, '
+                  f'now {sum(sell_multipliers)/len(sell_multipliers):.4f}')
+        else:
+            print(f'[day_ahead] Sell multipliers within floor: avg={avg_sell:.4f} '
+                  f'>= {avg_buy * SELL_FLOOR_RATIO:.4f}')
+    else:
+        print(f'[real_time] Skipping sell floor enforcement — full flexibility in real-time')
+
+    print(f'Final buy_multipliers={[round(m, 4) for m in buy_multipliers]}, '
           f'avg={sum(buy_multipliers)/len(buy_multipliers):.4f}')
-    print(f'Final sell_multipliers={[round(m,4) for m in sell_multipliers]}, '
+    print(f'Final sell_multipliers={[round(m, 4) for m in sell_multipliers]}, '
           f'avg={sum(sell_multipliers)/len(sell_multipliers):.4f}')
+    print(f'multipliers_rescaled={multipliers_rescaled}')
 
     # ── Build per-timestep price arrays ────────────────────────────────────
     S_buy  = []
@@ -486,9 +510,9 @@ def extract_scalars(data, price_guidance=None, optimization_mode='day_ahead',
         if not active_trip_rows:
             raise ValueError('No remaining trips to optimize for the requested real-time horizon')
 
-        gama = active_energy
+        gama    = active_energy
         T_start = active_starts
-        T_end = active_ends
+        T_end   = active_ends
         i_count = len(active_trip_rows)
 
     default_initial_soc = [0.2] * k_count
@@ -517,7 +541,7 @@ def extract_scalars(data, price_guidance=None, optimization_mode='day_ahead',
             if not 0 <= bus_idx < k_count:
                 continue
             current_energy = row.get('Current energy (kWh)')
-            current_soc = row.get('Current SOC')
+            current_soc    = row.get('Current SOC')
             if pd.notna(current_energy):
                 E_0[bus_idx] = max(0.0, min(1.0, float(current_energy) / C_bat[bus_idx]))
             elif pd.notna(current_soc):
@@ -545,25 +569,25 @@ def extract_scalars(data, price_guidance=None, optimization_mode='day_ahead',
           f'{"OK" if max(T_end[i]-T_start[i] for i in range(i_count)) < usable_kWh/drain_per_step else "INFEASIBLE"}')
 
     return {
-        'T_steps': T_steps,
+        'T_steps':            T_steps,
         'full_horizon_steps': full_horizon_steps,
-        'current_timestep': current_timestep,
-        'timestep_minutes': timestep_minutes,
-        'optimization_mode': optimization_mode,
+        'current_timestep':   current_timestep,
+        'timestep_minutes':   timestep_minutes,
+        'optimization_mode':  optimization_mode,
         'k_count': k_count, 'n_count': n_count,
         'i_count': i_count,
         'P': P, 'S_buy': S_buy, 'S_sell': S_sell,
         'avg_P': avg_P, 'avg_S_buy': avg_S_buy, 'avg_S_sell': avg_S_sell,
-        'buy_multipliers': buy_multipliers,
-        'sell_multipliers': sell_multipliers,
-        'boundaries': boundaries,
+        'buy_multipliers':    buy_multipliers,
+        'sell_multipliers':   sell_multipliers,
+        'multipliers_rescaled': multipliers_rescaled,
+        'boundaries':         boundaries,
         'C_bat': C_bat, 'alpha': alpha, 'beta': beta, 'gama': gama,
         'U_max': U_max,
         'T_start': T_start, 'T_end': T_end,
         'ch_eff': 0.90, 'dch_eff': 1.0 / 0.90,
         'E_0': E_0, 'E_min': 0.2, 'E_max': 1.0, 'E_end': 0.2,
     }
-
 
 
 def apply_disturbances(sc, disturbances):
@@ -630,16 +654,17 @@ def solvePTO(sc):
     model.T = pyo.RangeSet(T)
     model.K = pyo.RangeSet(sc['k_count'])
     model.N = pyo.RangeSet(sc['n_count'])
+
     # Parameters
-    model.T_start  = pyo.Param(model.I, initialize=lambda m,i: T_start[i-1])
-    model.T_end    = pyo.Param(model.I, initialize=lambda m,i: T_end_[i-1])
-    model.alpha    = pyo.Param(model.N, initialize=lambda m,n: alpha[n-1])
-    model.beta     = pyo.Param(model.N, initialize=lambda m,n: beta[n-1])
-    model.gama     = pyo.Param(model.I, initialize=lambda m,i: gama[i-1])
-    model.P        = pyo.Param(model.T, initialize=lambda m,t: P[t-1])
-    model.S_buy    = pyo.Param(model.T, initialize=lambda m,t: S_buy[t-1])
-    model.S_sell   = pyo.Param(model.T, initialize=lambda m,t: S_sell[t-1])
-    model.C_bat    = pyo.Param(model.K, initialize=lambda m,k: C_bat[k-1])
+    model.T_start  = pyo.Param(model.I, initialize=lambda m, i: T_start[i-1])
+    model.T_end    = pyo.Param(model.I, initialize=lambda m, i: T_end_[i-1])
+    model.alpha    = pyo.Param(model.N, initialize=lambda m, n: alpha[n-1])
+    model.beta     = pyo.Param(model.N, initialize=lambda m, n: beta[n-1])
+    model.gama     = pyo.Param(model.I, initialize=lambda m, i: gama[i-1])
+    model.P        = pyo.Param(model.T, initialize=lambda m, t: P[t-1])
+    model.S_buy    = pyo.Param(model.T, initialize=lambda m, t: S_buy[t-1])
+    model.S_sell   = pyo.Param(model.T, initialize=lambda m, t: S_sell[t-1])
+    model.C_bat    = pyo.Param(model.K, initialize=lambda m, k: C_bat[k-1])
 
     # Variables
     model.b      = pyo.Var(model.K, model.I, model.T, domain=pyo.Binary)
@@ -663,75 +688,75 @@ def solvePTO(sc):
     for k in model.K:
         for t in model.T:
             model.constraints.add(
-                sum(model.b[k,i,t] for i in model.I) + model.c[k,t] <= 1)
+                sum(model.b[k, i, t] for i in model.I) + model.c[k, t] <= 1)
 
     # ── Constraint 3: one bus per trip-timeslot ───────────────────────────
     for i in model.I:
         for t in range(model.T_start[i], model.T_end[i]):
             model.constraints.add(
-                sum(model.b[k,i,t] for k in model.K) == 1)
+                sum(model.b[k, i, t] for k in model.K) == 1)
 
     # ── Constraint 4: trip continuity ────────────────────────────────────
     for i in model.I:
         for k in model.K:
             for t in range(model.T_start[i], model.T_end[i]-1):
-                model.constraints.add(model.b[k,i,t+1] >= model.b[k,i,t])
+                model.constraints.add(model.b[k, i, t+1] >= model.b[k, i, t])
 
     # ── Constraint 5: one operation per charger per slot ─────────────────
     for n in model.N:
         for t in model.T:
             model.constraints.add(
-                sum(model.x[k,n,t] for k in model.K)
-              + sum(model.y[k,n,t] for k in model.K) <= 1)
+                sum(model.x[k, n, t] for k in model.K)
+              + sum(model.y[k, n, t] for k in model.K) <= 1)
 
     # ── Constraint 6: charger ops linked to c[k,t] ───────────────────────
     for k in model.K:
         for t in model.T:
             model.constraints.add(
-                sum(model.x[k,n,t] for n in model.N)
-              + sum(model.y[k,n,t] for n in model.N) <= model.c[k,t])
+                sum(model.x[k, n, t] for n in model.N)
+              + sum(model.y[k, n, t] for n in model.N) <= model.c[k, t])
 
     # ── Constraint 7: energy balance ─────────────────────────────────────
     for k in model.K:
-        model.constraints.add(model.e[k,1] == E_0[k-1] * C_bat[k-1])
+        model.constraints.add(model.e[k, 1] == E_0[k-1] * C_bat[k-1])
         for t in range(2, T+1):
             model.constraints.add(
-                model.e[k,t] == model.e[k,t-1]
-                + sum(ch_eff  * alpha[n-1] * model.x[k,n,t] for n in model.N)
-                - sum(gama[i-1] * model.b[k,i,t] for i in model.I)
-                - sum(dch_eff * beta[n-1]  * model.y[k,n,t] for n in model.N))
+                model.e[k, t] == model.e[k, t-1]
+                + sum(ch_eff  * alpha[n-1] * model.x[k, n, t] for n in model.N)
+                - sum(gama[i-1] * model.b[k, i, t] for i in model.I)
+                - sum(dch_eff * beta[n-1]  * model.y[k, n, t] for n in model.N))
 
     # ── Constraints 8.1-8.2: w_buy and w_sell definitions ────────────────
     for t in model.T:
         model.constraints.add(
-            sum(ch_eff * alpha[n-1] * model.x[k,n,t]
+            sum(ch_eff * alpha[n-1] * model.x[k, n, t]
                 for n in model.N for k in model.K) == model.w_buy[t])
         model.constraints.add(
-            sum(dch_eff * beta[n-1] * model.y[k,n,t]
+            sum(dch_eff * beta[n-1] * model.y[k, n, t]
                 for n in model.N for k in model.K) == model.w_sell[t])
 
     # No discharging at t=1
     model.constraints.add(
-        sum(dch_eff * beta[n-1] * model.y[k,n,1]
+        sum(dch_eff * beta[n-1] * model.y[k, n, 1]
             for n in model.N for k in model.K) == 0)
 
     # ── Constraint 9: site charging power limit ──────────────────────────
     for t in model.T:
         model.constraints.add(
-            sum(alpha[n-1]*model.x[k,n,t] for k in model.K for n in model.N)
-            <= U_max)
+            sum(alpha[n-1] * model.x[k, n, t]
+                for k in model.K for n in model.N) <= U_max)
 
     # ── Constraints 10-11: SOC bounds ────────────────────────────────────
     for k in model.K:
         for t in model.T:
-            model.constraints.add(model.e[k,t] >= C_bat[k-1] * E_min)
-            model.constraints.add(model.e[k,t] <= E_max * C_bat[k-1])
+            model.constraints.add(model.e[k, t] >= C_bat[k-1] * E_min)
+            model.constraints.add(model.e[k, t] <= E_max * C_bat[k-1])
 
     # ── Constraint 12: end-of-day minimum SOC ────────────────────────────
     for k in model.K:
         model.constraints.add(
             model.e[k, T-1]
-            + sum(ch_eff * alpha[n-1] * model.x[k,n,T] for n in model.N)
+            + sum(ch_eff * alpha[n-1] * model.x[k, n, T] for n in model.N)
             >= E_end * C_bat[k-1])
 
     # ── Objective: min PTO daily cost ────────────────────────────────────
@@ -750,12 +775,12 @@ def solvePTO(sc):
         load_solutions=False,
         tee=False,
         options={
-            'threads': os.cpu_count(),  # use all available cores
+            'threads': os.cpu_count(),
             'parallel': 'on',
         }
     )
     results = opt.solve(model, load_solutions=False, tee=False,
-                    options={'threads': 8, 'time_limit': 12000})
+                        options={'threads': 8, 'time_limit': 12000})
     tc = results.solver.termination_condition
     print(f'PTO termination: {tc}')
     if tc in (pyo.TerminationCondition.optimal,
@@ -776,8 +801,8 @@ def run_optimization(job_id, input_data, price_guidance=None,
                      disturbances=None, optimization_mode='day_ahead',
                      current_timestep=1):
     try:
-        price_guidance = price_guidance or {}
-        disturbances = disturbances or []
+        price_guidance    = price_guidance or {}
+        disturbances      = disturbances or []
         optimization_mode = (optimization_mode or 'day_ahead').lower()
 
         print(f'Job {job_id} started')
@@ -805,9 +830,9 @@ def run_optimization(job_id, input_data, price_guidance=None,
         if model is None:
             mock = dict(MOCK_RESULT)
             mock.update({
-                'optimization_mode':     optimization_mode,
-                'current_timestep':      sc['current_timestep'],
-                'optimized_steps':       sc['T_steps'],
+                'optimization_mode':    optimization_mode,
+                'current_timestep':     sc['current_timestep'],
+                'optimized_steps':      sc['T_steps'],
                 'price_guidance_used':  price_guidance,
                 'disturbances_applied': disturbances,
                 'mock_reason':          'PTO optimization infeasible',
@@ -815,12 +840,12 @@ def run_optimization(job_id, input_data, price_guidance=None,
                 'sell_multipliers':     sc['sell_multipliers'],
                 'period_boundaries':    sc['boundaries'],
                 'avg_grid_price':       sc['avg_P'],
+                'multipliers_rescaled': sc['multipliers_rescaled'],
             })
             save_job(job_id, mock)
             return
 
         # ── Economic metrics ──────────────────────────────────────────────
-        # PTO costs and revenues
         total_pto_buy_cost = sum(
             sc['S_buy'][t-1] * pyo.value(model.w_buy[t])
             for t in range(1, T+1))
@@ -829,9 +854,6 @@ def run_optimization(job_id, input_data, price_guidance=None,
             for t in range(1, T+1))
         pto_daily_cost = total_pto_buy_cost - total_pto_sell_rev
 
-        # EBA margins:
-        # Charging margin: EBA buys from grid at P[t], sells to PTO at S_buy[t]
-        # V2G margin:      EBA buys from PTO at S_sell[t], resells to grid at P[t]
         agg_buy_margin = sum(
             (sc['S_buy'][t-1] - sc['P'][t-1]) * pyo.value(model.w_buy[t])
             for t in range(1, T+1))
@@ -865,6 +887,7 @@ def run_optimization(job_id, input_data, price_guidance=None,
             "avg_grid_price":         sc['avg_P'],
             "avg_buy_price":          sc['avg_S_buy'],
             "avg_sell_price":         sc['avg_S_sell'],
+            "multipliers_rescaled":   sc['multipliers_rescaled'],
             # Economic outcomes
             "pto_daily_cost":         pto_daily_cost,
             "aggregator_revenue":     aggregator_revenue,
@@ -879,7 +902,7 @@ def run_optimization(job_id, input_data, price_guidance=None,
                        for t in range(1, T+1)],
             "w_sell": [float(pyo.value(model.w_sell[t]))
                        for t in range(1, T+1)],
-            "energy": [[float(pyo.value(model.e[k,t]))
+            "energy": [[float(pyo.value(model.e[k, t]))
                         for t in range(1, T+1)]
                        for k in range(1, sc['k_count']+1)],
         }
@@ -890,12 +913,12 @@ def run_optimization(job_id, input_data, price_guidance=None,
         traceback.print_exc()
         mock = dict(MOCK_RESULT)
         mock.update({
-            'optimization_mode':     optimization_mode,
-            'current_timestep':      current_timestep,
-            'optimized_steps':       0,
-            'price_guidance_used':   price_guidance,
-            'disturbances_applied':  disturbances,
-            'mock_reason':           f'Unexpected error: {str(e)}',
+            'optimization_mode':    optimization_mode,
+            'current_timestep':     current_timestep,
+            'optimized_steps':      0,
+            'price_guidance_used':  price_guidance,
+            'disturbances_applied': disturbances,
+            'mock_reason':          f'Unexpected error: {str(e)}',
         })
         save_job(job_id, mock)
 
@@ -906,12 +929,12 @@ def run_optimization(job_id, input_data, price_guidance=None,
 @app.route('/optimize', methods=['POST'])
 def optimize():
     try:
-        payload = request.json or {}
-        input_data = payload['input']
-        price_guidance = payload.get('price_guidance', {})
-        disturbances = payload.get('disturbances', [])
+        payload           = request.json or {}
+        input_data        = payload['input']
+        price_guidance    = payload.get('price_guidance', {})
+        disturbances      = payload.get('disturbances', [])
         optimization_mode = payload.get('optimization_mode', 'day_ahead')
-        current_timestep = payload.get('current_timestep', 1)
+        current_timestep  = payload.get('current_timestep', 1)
         job_id = str(uuid.uuid4())
         save_job(job_id, {"status": "running"})
         threading.Thread(
@@ -926,10 +949,10 @@ def optimize():
             )
         ).start()
         return jsonify({
-            "job_id": job_id,
-            "status": "running",
-            "optimization_mode": optimization_mode,
-            "current_timestep": current_timestep,
+            "job_id":             job_id,
+            "status":             "running",
+            "optimization_mode":  optimization_mode,
+            "current_timestep":   current_timestep,
         })
     except Exception as e:
         traceback.print_exc()
@@ -959,5 +982,5 @@ if __name__ == '__main__':
     app.run(
         host='0.0.0.0',
         port=int(os.environ.get('PORT', 5000)),
-        threaded=True  # add this
+        threaded=True
     )
