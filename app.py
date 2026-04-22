@@ -803,8 +803,11 @@ def solvePTO(sc):
     model.obj = pyo.Objective(rule=rule_obj, sense=pyo.minimize)
 
     print('Solving PTO')
-    opt = pyo.SolverFactory('highs')
-    results = opt.solve(model, load_solutions=False, tee=False)
+    opt = pyo.SolverFactory('gurobi')
+    opt.options['TimeLimit'] = 60
+    opt.options['MIPGap'] = 0.04
+    results = opt.solve(model, load_solutions=False, tee=True)
+    
     tc = results.solver.termination_condition
     print(f'PTO termination: {tc}')
     if tc in (pyo.TerminationCondition.optimal, pyo.TerminationCondition.feasible):
@@ -1007,4 +1010,4 @@ def health():
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5002)))
