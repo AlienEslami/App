@@ -94,8 +94,25 @@ def build_dataframes(input_data):
             'average_velocity_kmh': 'Average velocity (km/h)',
             'average_velocity_kmmin': 'Average velocity (km/min)',
         })
-    prices = pd.DataFrame(input_data['prices']).rename(
-        columns={'spot_market': 'Spot Market', 'time': 'Time'})
+    spot_source = pd.DataFrame(input_data.get('grid_prices', input_data.get('prices', [])))
+    spot_prices = spot_source.rename(columns={
+        'spot_market': 'Spot Market',
+        'spot_price': 'Spot Market',
+        'price': 'Spot Market',
+        'time': 'Time',
+        'timestep': 'Time',
+    })
+    tariffs_source = pd.DataFrame(input_data.get('tariffs', []))
+    tariffs = tariffs_source.rename(columns={
+        'buy_price': 'Buy Tariff',
+        'sell_price': 'Sell Tariff',
+        'buy_tariff': 'Buy Tariff',
+        'sell_tariff': 'Sell Tariff',
+        'buy': 'Buy Tariff',
+        'sell': 'Sell Tariff',
+        'time': 'Time',
+        'timestep': 'Time',
+    })
     realtime_state = pd.DataFrame(input_data.get('realtime_state', [])).rename(
         columns={
             'bus_id':             'Bus ID',
@@ -110,9 +127,12 @@ def build_dataframes(input_data):
         'Chargers':           chargers,
         'Trip time':          trip_time,
         'Energy consumption': energy_consumption,
-        'Prices':             prices,
+        'Spot Prices':        spot_prices,
+        'Prices':             spot_prices,
+        'Tariffs':            tariffs,
         'Realtime state':     realtime_state,
         'timestep_minutes':   input_data.get('timestep_minutes'),
+        'v2g_enabled':        input_data.get('v2g_enabled'),
     }
 
 
@@ -124,6 +144,19 @@ def normalize_soc(value):
     if soc > 1.0:
         soc = soc / 100.0
     return max(0.0, min(1.0, soc))
+
+
+def parse_bool(value, default=True):
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {'1', 'true', 'yes', 'on', 'enabled'}:
+        return True
+    if text in {'0', 'false', 'no', 'off', 'disabled'}:
+        return False
+    return default
 
 
 def parse_time_to_step(value, timestep_minutes, full_horizon_steps, is_end=False):
@@ -272,6 +305,7 @@ def extract_scalars(data, price_guidance=None, optimization_mode='day_ahead',
                     current_timestep=1):
     price_guidance = price_guidance or {}
     optimization_mode = (optimization_mode or 'day_ahead').lower()
+    v2g_enabled = parse_bool(data.get('v2g_enabled', True), default=True)
 
     # ── Fleet size ──────────────────────────────────────────────────────────
     k_count = len(data['Buses'])
@@ -282,13 +316,14 @@ def extract_scalars(data, price_guidance=None, optimization_mode='day_ahead',
         raise ValueError('buses, chargers, and trip_time inputs must all be non-empty')
 
     # ── Grid buying price P — from data, not LLM-controlled ────────────────
-    P_raw = pd.to_numeric(data['Prices']['Spot Market'], errors='coerce').dropna().tolist()
+    price_table = data.get('Spot Prices', data.get('Prices'))
+    P_raw = pd.to_numeric(price_table['Spot Market'], errors='coerce').dropna().tolist()
     if not P_raw:
-        raise ValueError('prices input must include at least one valid Spot Market value')
+        raise ValueError('grid_prices/prices input must include at least one valid Spot Market value')
 
     full_horizon_steps = len(P_raw)
     current_timestep = max(1, min(int(current_timestep or 1), full_horizon_steps))
-    timestep_minutes = get_timestep_minutes(data, data['Prices'])
+    timestep_minutes = get_timestep_minutes(data, price_table)
     timestep_hours = timestep_minutes / 60.0
 
     realtime = data['Realtime state']
@@ -303,78 +338,90 @@ def extract_scalars(data, price_guidance=None, optimization_mode='day_ahead',
 
     avg_P   = sum(P) / len(P)
 
-    mode = price_guidance.get('mode', 'altruistic')
+    tariffs_table = data.get('Tariffs', pd.DataFrame())
+    use_explicit_tariffs = (
+        not tariffs_table.empty
+        and 'Buy Tariff' in tariffs_table.columns
+        and 'Sell Tariff' in tariffs_table.columns
+    )
 
-    # ── Period boundaries — divide day into 3 equal parts ──────────────────
-    default_boundaries = [T_steps // 3, (T_steps * 2) // 3, T_steps]
-    boundaries = price_guidance.get('period_boundaries', default_boundaries)
-    # Ensure last boundary covers full T_steps
-    boundaries[-1] = T_steps
+    if use_explicit_tariffs:
+        buy_series_full = pd.to_numeric(
+            tariffs_table['Buy Tariff'], errors='coerce').tolist()
+        sell_series_full = pd.to_numeric(
+            tariffs_table['Sell Tariff'], errors='coerce').tolist()
+        if len(buy_series_full) < full_horizon_steps or len(sell_series_full) < full_horizon_steps:
+            raise ValueError(
+                'tariffs input must include Buy Tariff and Sell Tariff for the full horizon')
+        buy_window = buy_series_full[current_timestep - 1: current_timestep - 1 + T_steps]
+        sell_window = sell_series_full[current_timestep - 1: current_timestep - 1 + T_steps]
+        if any(pd.isna(v) for v in buy_window) or any(pd.isna(v) for v in sell_window):
+            raise ValueError('tariffs input contains missing Buy Tariff/Sell Tariff values')
 
-    # ── Read raw multipliers from price guidance ────────────────────────────
-    buy_mults_raw  = price_guidance.get('buy_multipliers',  [1.05, 1.10, 1.05])
-    sell_mults_raw = price_guidance.get('sell_multipliers', [0.80, 0.85, 0.80])
-    # ── Step 1: clip individual multipliers ─────────────────────────────────
-    buy_multipliers  = [max(1.01, min(1.50, float(m))) for m in buy_mults_raw]
-    sell_multipliers = [max(0.40, min(0.99, float(m))) for m in sell_mults_raw]
+        S_buy = [float(value) for value in buy_window]
+        S_sell = [float(value) for value in sell_window]
+        buy_multipliers = []
+        sell_multipliers = []
+        boundaries = []
+        print('Using explicit tariffs input (Buy Tariff / Sell Tariff), not multiplier guidance')
+    else:
+        mode = price_guidance.get('mode', 'altruistic')
 
-    # ── Step 2: enforce average buy multiplier (eq 7 analog from paper) ─────
-    # eq 7 analog: average buy price EBA charges PTO ≈ average grid price
-    # Multiplier average should stay close to 1.0
-    # Allow small tolerance: selfish can go up to 1.05, altruistic up to 1.02
-    TARGET_AVG_BUY = 1.05   # selfish: small average premium allowed
-    TARGET_AVG_ALT = 1.02   # altruistic: essentially pass-through pricing
+        # ── Period boundaries — divide day into 3 equal parts ──────────────
+        default_boundaries = [T_steps // 3, (T_steps * 2) // 3, T_steps]
+        boundaries = price_guidance.get('period_boundaries', default_boundaries)
+        boundaries[-1] = T_steps
 
-    target = TARGET_AVG_BUY if mode == 'selfish' else TARGET_AVG_ALT
+        # ── Read raw multipliers from price guidance ────────────────────────
+        buy_mults_raw = price_guidance.get('buy_multipliers', [1.05, 1.10, 1.05])
+        sell_mults_raw = price_guidance.get('sell_multipliers', [0.80, 0.85, 0.80])
+        buy_multipliers = [max(1.01, min(1.50, float(m))) for m in buy_mults_raw]
+        sell_multipliers = [max(0.40, min(0.99, float(m))) for m in sell_mults_raw]
 
-    actual_avg_buy = sum(buy_multipliers) / len(buy_multipliers)
-    if actual_avg_buy > target:
-        scale = target / actual_avg_buy
-        buy_multipliers = [max(1.01, m * scale) for m in buy_multipliers]
-        print(f'Buy multipliers rescaled: avg was {actual_avg_buy:.4f}, '
-              f'now {sum(buy_multipliers)/len(buy_multipliers):.4f}')
+        TARGET_AVG_BUY = 1.05
+        TARGET_AVG_ALT = 1.02
+        target = TARGET_AVG_BUY if mode == 'selfish' else TARGET_AVG_ALT
 
-    # ── Step 3: enforce sell multipliers stay below buy multipliers ──────────
-    # S_sell[t] must always be less than S_buy[t] (EBA can't pay more than it charges)
-    # and less than P[t] (EBA must profit on V2G resale)
-    # δ relationship from paper: ρ^- = δ × ρ^+ (sell is fraction of buy)
-    # We enforce this per-period
-    sell_multipliers = [
-        min(sell_multipliers[i], buy_multipliers[i] - 0.01)  # sell < buy always
-        for i in range(len(sell_multipliers))
-    ]
+        actual_avg_buy = sum(buy_multipliers) / len(buy_multipliers)
+        if actual_avg_buy > target:
+            scale = target / actual_avg_buy
+            buy_multipliers = [max(1.01, m * scale) for m in buy_multipliers]
+            print(f'Buy multipliers rescaled: avg was {actual_avg_buy:.4f}, '
+                  f'now {sum(buy_multipliers)/len(buy_multipliers):.4f}')
 
-    # ── Step 4: enforce average sell multiplier ──────────────────────────────
-    # Average sell price EBA pays PTO should not be below a floor
-    # (prevents EBA from paying almost nothing for V2G — unrealistic)
-    # Floor: sell average must be at least 0.60 × buy average
-    avg_buy  = sum(buy_multipliers)  / len(buy_multipliers)
-    avg_sell = sum(sell_multipliers) / len(sell_multipliers)
-    SELL_FLOOR_RATIO = 0.60
-    if avg_sell < avg_buy * SELL_FLOOR_RATIO:
-        scale_up = (avg_buy * SELL_FLOOR_RATIO) / avg_sell
-        sell_multipliers = [min(m * scale_up, buy_multipliers[i] - 0.01)
-                            for i, m in enumerate(sell_multipliers)]
-        print(f'Sell multipliers rescaled up: avg was {avg_sell:.4f}, '
-              f'now {sum(sell_multipliers)/len(sell_multipliers):.4f}')
+        sell_multipliers = [
+            min(sell_multipliers[i], buy_multipliers[i] - 0.01)
+            for i in range(len(sell_multipliers))
+        ]
 
-    print(f'Final buy_multipliers={[round(m,4) for m in buy_multipliers]}, '
-          f'avg={sum(buy_multipliers)/len(buy_multipliers):.4f}')
-    print(f'Final sell_multipliers={[round(m,4) for m in sell_multipliers]}, '
-          f'avg={sum(sell_multipliers)/len(sell_multipliers):.4f}')
+        avg_buy = sum(buy_multipliers) / len(buy_multipliers)
+        avg_sell = sum(sell_multipliers) / len(sell_multipliers)
+        SELL_FLOOR_RATIO = 0.60
+        if avg_sell < avg_buy * SELL_FLOOR_RATIO:
+            scale_up = (avg_buy * SELL_FLOOR_RATIO) / avg_sell
+            sell_multipliers = [
+                min(m * scale_up, buy_multipliers[i] - 0.01)
+                for i, m in enumerate(sell_multipliers)
+            ]
+            print(f'Sell multipliers rescaled up: avg was {avg_sell:.4f}, '
+                  f'now {sum(sell_multipliers)/len(sell_multipliers):.4f}')
 
-    # ── Build per-timestep price arrays ────────────────────────────────────
-    S_buy  = []
-    S_sell = []
-    for t_idx in range(T_steps):
-        if t_idx < boundaries[0]:
-            p = 0
-        elif t_idx < boundaries[1]:
-            p = 1
-        else:
-            p = 2
-        S_buy.append(buy_multipliers[p]  * P[t_idx])
-        S_sell.append(sell_multipliers[p] * P[t_idx])
+        print(f'Final buy_multipliers={[round(m,4) for m in buy_multipliers]}, '
+              f'avg={sum(buy_multipliers)/len(buy_multipliers):.4f}')
+        print(f'Final sell_multipliers={[round(m,4) for m in sell_multipliers]}, '
+              f'avg={sum(sell_multipliers)/len(sell_multipliers):.4f}')
+
+        S_buy = []
+        S_sell = []
+        for t_idx in range(T_steps):
+            if t_idx < boundaries[0]:
+                period = 0
+            elif t_idx < boundaries[1]:
+                period = 1
+            else:
+                period = 2
+            S_buy.append(buy_multipliers[period] * P[t_idx])
+            S_sell.append(sell_multipliers[period] * P[t_idx])
 
     avg_S_buy  = sum(S_buy)  / len(S_buy)
     avg_S_sell = sum(S_sell) / len(S_sell)
@@ -530,6 +577,7 @@ def extract_scalars(data, price_guidance=None, optimization_mode='day_ahead',
     drain_per_step  = gama[0]
     usable_kWh      = (1.0 - 0.2) * C_bat[0]
     print(f'mode={optimization_mode}, current_timestep={current_timestep}')
+    print(f'v2g_enabled={v2g_enabled}')
     print(f'timestep_minutes={timestep_minutes}')
     print(f'T={T_steps}, k={k_count}, n={n_count}, i={i_count}')
     print(f'avg_P={avg_P:.6f}')
@@ -550,6 +598,7 @@ def extract_scalars(data, price_guidance=None, optimization_mode='day_ahead',
         'current_timestep': current_timestep,
         'timestep_minutes': timestep_minutes,
         'optimization_mode': optimization_mode,
+        'v2g_enabled': v2g_enabled,
         'k_count': k_count, 'n_count': n_count,
         'i_count': i_count,
         'P': P, 'S_buy': S_buy, 'S_sell': S_sell,
@@ -624,6 +673,7 @@ def solvePTO(sc):
     U_max   = sc['U_max']
     T_start = sc['T_start']
     T_end_  = sc['T_end']
+    v2g_enabled = sc.get('v2g_enabled', True)
 
     model = pyo.ConcreteModel()
     model.I = pyo.RangeSet(sc['i_count'])
@@ -715,6 +765,13 @@ def solvePTO(sc):
         sum(dch_eff * beta[n-1] * model.y[k,n,1]
             for n in model.N for k in model.K) == 0)
 
+    if not v2g_enabled:
+        for t in model.T:
+            model.constraints.add(model.w_sell[t] == 0)
+            for k in model.K:
+                for n in model.N:
+                    model.constraints.add(model.y[k, n, t] == 0)
+
     # ── Constraint 9: site charging power limit ──────────────────────────
     for t in model.T:
         model.constraints.add(
@@ -738,31 +795,23 @@ def solvePTO(sc):
     # PTO pays S_buy[t] per kWh to EBA for charging
     # PTO receives S_sell[t] per kWh from EBA for V2G
     def rule_obj(mod):
-        return (sum(S_buy[t-1]  * mod.w_buy[t]  for t in mod.T)
-              - sum(S_sell[t-1] * mod.w_sell[t] for t in mod.T))
+        if v2g_enabled:
+            return (sum(S_buy[t-1]  * mod.w_buy[t]  for t in mod.T)
+                  - sum(S_sell[t-1] * mod.w_sell[t] for t in mod.T))
+        return sum(S_buy[t-1] * mod.w_buy[t] for t in mod.T)
 
     model.obj = pyo.Objective(rule=rule_obj, sense=pyo.minimize)
 
     print('Solving PTO')
-    opt = pyo.SolverFactory('highs')
-    results = opt.solve(
-        model,
-        load_solutions=False,
-        tee=False,
-        options={
-            'threads': os.cpu_count(),  # use all available cores
-            'parallel': 'on',
-        }
-    )
-    results = opt.solve(model, load_solutions=False, tee=False,
-                    options={'threads': 8, 'time_limit': 12000})
+    opt = pyo.SolverFactory('gurobi')
+    opt.options['TimeLimit'] = 60
+    opt.options['MIPGap'] = 0.04
+    results = opt.solve(model, load_solutions=False, tee=True)
+    
     tc = results.solver.termination_condition
     print(f'PTO termination: {tc}')
-    if tc in (pyo.TerminationCondition.optimal,
-              pyo.TerminationCondition.feasible,
-              pyo.TerminationCondition.maxTimeLimit):
-        if results.solver.status == pyo.SolverStatus.ok or len(model.solutions) > 0:
-            model.solutions.load_from(results)
+    if tc in (pyo.TerminationCondition.optimal, pyo.TerminationCondition.feasible):
+        model.solutions.load_from(results)
         print('PTO done')
         return model
     print(f'PTO infeasible: {tc}')
@@ -782,6 +831,7 @@ def run_optimization(job_id, input_data, price_guidance=None,
 
         print(f'Job {job_id} started')
         print(f'Optimization mode: {optimization_mode}')
+        print(f'V2G enabled:       {parse_bool(input_data.get("v2g_enabled", True), default=True)}')
         print(f'Current timestep:  {current_timestep}')
         print(f'Price guidance: {price_guidance}')
         print(f'Disturbances:   {disturbances}')
@@ -808,6 +858,7 @@ def run_optimization(job_id, input_data, price_guidance=None,
                 'optimization_mode':     optimization_mode,
                 'current_timestep':      sc['current_timestep'],
                 'optimized_steps':       sc['T_steps'],
+                'v2g_enabled':          sc.get('v2g_enabled', True),
                 'price_guidance_used':  price_guidance,
                 'disturbances_applied': disturbances,
                 'mock_reason':          'PTO optimization infeasible',
@@ -856,6 +907,7 @@ def run_optimization(job_id, input_data, price_guidance=None,
             "optimization_mode":      optimization_mode,
             "current_timestep":       sc['current_timestep'],
             "optimized_steps":        T,
+            "v2g_enabled":           sc.get('v2g_enabled', True),
             "price_guidance_used":    price_guidance,
             "disturbances_applied":   disturbances,
             # Price settings
@@ -912,6 +964,8 @@ def optimize():
         disturbances = payload.get('disturbances', [])
         optimization_mode = payload.get('optimization_mode', 'day_ahead')
         current_timestep = payload.get('current_timestep', 1)
+        if 'v2g_enabled' in payload:
+            input_data['v2g_enabled'] = payload.get('v2g_enabled')
         job_id = str(uuid.uuid4())
         save_job(job_id, {"status": "running"})
         threading.Thread(
@@ -956,8 +1010,4 @@ def health():
 
 
 if __name__ == '__main__':
-    app.run(
-        host='0.0.0.0',
-        port=int(os.environ.get('PORT', 5000)),
-        threaded=True  # add this
-    )
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5002)))
