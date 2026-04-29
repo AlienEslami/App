@@ -209,6 +209,86 @@ def get_timestep_minutes(input_data, prices):
     return 15.0
 
 
+def infer_full_horizon_steps(timestep_minutes, series_length):
+    expected_day_steps = max(1, int(round(1440.0 / float(timestep_minutes))))
+    if series_length <= 0:
+        return expected_day_steps
+    if series_length == expected_day_steps:
+        return expected_day_steps
+    if expected_day_steps % series_length == 0:
+        return expected_day_steps
+    return series_length
+
+
+def expand_series_to_horizon(values, target_steps, series_name):
+    values = [float(v) for v in values]
+    if not values:
+        raise ValueError(f'{series_name} cannot be empty')
+    if len(values) == target_steps:
+        return values
+    if len(values) == 1:
+        return values * target_steps
+    if target_steps % len(values) == 0:
+        repeat = target_steps // len(values)
+        expanded = []
+        for value in values:
+            expanded.extend([value] * repeat)
+        return expanded
+    expanded = []
+    for idx in range(target_steps):
+        src_idx = min(len(values) - 1, int(idx * len(values) / target_steps))
+        expanded.append(values[src_idx])
+    return expanded
+
+
+def scale_boundaries_to_horizon(boundaries, target_steps, source_steps=None):
+    if not boundaries:
+        return [target_steps]
+    cleaned = [max(1, int(round(float(b)))) for b in boundaries]
+    if source_steps is None:
+        source_steps = cleaned[-1]
+    source_steps = max(1, int(round(float(source_steps))))
+    if source_steps == target_steps:
+        scaled = cleaned
+    else:
+        scaled = [max(1, min(target_steps, int(round((b / source_steps) * target_steps)))) for b in cleaned]
+    monotonic = []
+    prev = 0
+    for i, boundary in enumerate(scaled):
+        minimum = prev + 1 if i < len(scaled) - 1 else target_steps
+        boundary = max(minimum, boundary)
+        boundary = min(target_steps, boundary)
+        monotonic.append(boundary)
+        prev = boundary
+    monotonic[-1] = target_steps
+    return monotonic
+
+
+def build_multiplier_schedule(multiplier_values, boundaries, target_steps, series_name):
+    multipliers = [float(v) for v in multiplier_values]
+    if not multipliers:
+        raise ValueError(f'{series_name} cannot be empty')
+    if len(multipliers) == target_steps:
+        return multipliers, list(range(1, target_steps + 1))
+
+    source_steps = boundaries[-1] if boundaries else len(multipliers)
+    scaled_boundaries = scale_boundaries_to_horizon(boundaries or [len(multipliers)], target_steps, source_steps)
+
+    if len(multipliers) == len(scaled_boundaries):
+        schedule = []
+        start = 0
+        for multiplier, end in zip(multipliers, scaled_boundaries):
+            end = max(start + 1, min(target_steps, int(end)))
+            schedule.extend([multiplier] * (end - start))
+            start = end
+        if len(schedule) < target_steps:
+            schedule.extend([multipliers[-1]] * (target_steps - len(schedule)))
+        return schedule[:target_steps], scaled_boundaries
+
+    expanded = expand_series_to_horizon(multipliers, target_steps, series_name)
+    return expanded, list(range(1, target_steps + 1))
+
+
 def get_speed_km_per_hour_series(energy_consumption, count):
     speed_columns = [
         ('Average velocity (km/h)', 1.0),
@@ -317,14 +397,16 @@ def extract_scalars(data, price_guidance=None, optimization_mode='day_ahead',
 
     # ── Grid buying price P — from data, not LLM-controlled ────────────────
     price_table = data.get('Spot Prices', data.get('Prices'))
-    P_raw = pd.to_numeric(price_table['Spot Market'], errors='coerce').dropna().tolist()
-    if not P_raw:
+    P_source = pd.to_numeric(price_table['Spot Market'], errors='coerce').dropna().tolist()
+    if not P_source:
         raise ValueError('grid_prices/prices input must include at least one valid Spot Market value')
 
-    full_horizon_steps = len(P_raw)
-    current_timestep = max(1, min(int(current_timestep or 1), full_horizon_steps))
     timestep_minutes = get_timestep_minutes(data, price_table)
     timestep_hours = timestep_minutes / 60.0
+    full_horizon_steps = infer_full_horizon_steps(timestep_minutes, len(P_source))
+    P_raw = expand_series_to_horizon(P_source, full_horizon_steps, 'Spot Market prices')
+
+    current_timestep = max(1, min(int(current_timestep or 1), full_horizon_steps))
 
     realtime = data['Realtime state']
     if optimization_mode == 'real_time':
@@ -346,85 +428,81 @@ def extract_scalars(data, price_guidance=None, optimization_mode='day_ahead',
     )
 
     if use_explicit_tariffs:
-        buy_series_full = pd.to_numeric(
-            tariffs_table['Buy Tariff'], errors='coerce').tolist()
-        sell_series_full = pd.to_numeric(
-            tariffs_table['Sell Tariff'], errors='coerce').tolist()
-        if len(buy_series_full) < full_horizon_steps or len(sell_series_full) < full_horizon_steps:
-            raise ValueError(
-                'tariffs input must include Buy Tariff and Sell Tariff for the full horizon')
+        buy_series_source = pd.to_numeric(
+            tariffs_table['Buy Tariff'], errors='coerce').dropna().tolist()
+        sell_series_source = pd.to_numeric(
+            tariffs_table['Sell Tariff'], errors='coerce').dropna().tolist()
+        if not buy_series_source or not sell_series_source:
+            raise ValueError('tariffs input contains missing Buy Tariff/Sell Tariff values')
+
+        buy_series_full = expand_series_to_horizon(
+            buy_series_source, full_horizon_steps, 'Buy Tariff')
+        sell_series_full = expand_series_to_horizon(
+            sell_series_source, full_horizon_steps, 'Sell Tariff')
         buy_window = buy_series_full[current_timestep - 1: current_timestep - 1 + T_steps]
         sell_window = sell_series_full[current_timestep - 1: current_timestep - 1 + T_steps]
-        if any(pd.isna(v) for v in buy_window) or any(pd.isna(v) for v in sell_window):
-            raise ValueError('tariffs input contains missing Buy Tariff/Sell Tariff values')
 
         S_buy = [float(value) for value in buy_window]
         S_sell = [float(value) for value in sell_window]
-        buy_multipliers = []
-        sell_multipliers = []
-        boundaries = []
-        print('Using explicit tariffs input (Buy Tariff / Sell Tariff), not multiplier guidance')
+        buy_multipliers = [
+            (S_buy[idx] / P[idx]) if P[idx] else 0.0
+            for idx in range(T_steps)
+        ]
+        sell_multipliers = [
+            (S_sell[idx] / P[idx]) if P[idx] else 0.0
+            for idx in range(T_steps)
+        ]
+        boundaries = list(range(1, T_steps + 1))
+        print('Using explicit tariffs input (Buy Tariff / Sell Tariff), scaled to model horizon')
     else:
-        mode = price_guidance.get('mode', 'altruistic')
-
-        # ── Period boundaries — divide day into 3 equal parts ──────────────
-        default_boundaries = [T_steps // 3, (T_steps * 2) // 3, T_steps]
-        boundaries = price_guidance.get('period_boundaries', default_boundaries)
-        boundaries[-1] = T_steps
-
-        # ── Read raw multipliers from price guidance ────────────────────────
         buy_mults_raw = price_guidance.get('buy_multipliers', [1.05, 1.10, 1.05])
         sell_mults_raw = price_guidance.get('sell_multipliers', [0.80, 0.85, 0.80])
-        buy_multipliers = [max(1.01, min(1.50, float(m))) for m in buy_mults_raw]
-        sell_multipliers = [max(0.40, min(0.99, float(m))) for m in sell_mults_raw]
+        raw_boundaries = price_guidance.get('period_boundaries')
 
-        TARGET_AVG_BUY = 1.05
-        TARGET_AVG_ALT = 1.02
-        target = TARGET_AVG_BUY if mode == 'selfish' else TARGET_AVG_ALT
+        buy_mults_clean = [float(m) for m in buy_mults_raw]
+        sell_mults_clean = [float(m) for m in sell_mults_raw]
 
-        actual_avg_buy = sum(buy_multipliers) / len(buy_multipliers)
-        if actual_avg_buy > target:
-            scale = target / actual_avg_buy
-            buy_multipliers = [max(1.01, m * scale) for m in buy_multipliers]
-            print(f'Buy multipliers rescaled: avg was {actual_avg_buy:.4f}, '
-                  f'now {sum(buy_multipliers)/len(buy_multipliers):.4f}')
+        default_boundaries = list(range(1, len(buy_mults_clean) + 1))
+        source_boundaries = raw_boundaries or default_boundaries
+        source_steps = max(
+            int(source_boundaries[-1]) if source_boundaries else len(buy_mults_clean),
+            len(buy_mults_clean),
+            len(sell_mults_clean),
+        )
 
-        sell_multipliers = [
-            min(sell_multipliers[i], buy_multipliers[i] - 0.01)
-            for i in range(len(sell_multipliers))
+        buy_schedule_full, scaled_boundaries = build_multiplier_schedule(
+            buy_mults_clean, source_boundaries, full_horizon_steps, 'buy multipliers')
+        sell_schedule_full, _ = build_multiplier_schedule(
+            sell_mults_clean, source_boundaries, full_horizon_steps, 'sell multipliers')
+        sell_schedule_full = [
+            min(sell_schedule_full[i], buy_schedule_full[i] - 0.01)
+            for i in range(full_horizon_steps)
         ]
 
-        avg_buy = sum(buy_multipliers) / len(buy_multipliers)
-        avg_sell = sum(sell_multipliers) / len(sell_multipliers)
-        SELL_FLOOR_RATIO = 0.60
-        if avg_sell < avg_buy * SELL_FLOOR_RATIO:
-            scale_up = (avg_buy * SELL_FLOOR_RATIO) / avg_sell
-            sell_multipliers = [
-                min(m * scale_up, buy_multipliers[i] - 0.01)
-                for i, m in enumerate(sell_multipliers)
-            ]
-            print(f'Sell multipliers rescaled up: avg was {avg_sell:.4f}, '
-                  f'now {sum(sell_multipliers)/len(sell_multipliers):.4f}')
+        buy_multipliers = buy_schedule_full[current_timestep - 1: current_timestep - 1 + T_steps]
+        sell_multipliers = sell_schedule_full[current_timestep - 1: current_timestep - 1 + T_steps]
+        boundaries = [
+            boundary - current_timestep + 1
+            for boundary in scaled_boundaries
+            if current_timestep <= boundary <= current_timestep - 1 + T_steps
+        ]
+        if not boundaries or boundaries[-1] != T_steps:
+            boundaries.append(T_steps)
 
-        print(f'Final buy_multipliers={[round(m,4) for m in buy_multipliers]}, '
-              f'avg={sum(buy_multipliers)/len(buy_multipliers):.4f}')
-        print(f'Final sell_multipliers={[round(m,4) for m in sell_multipliers]}, '
-              f'avg={sum(sell_multipliers)/len(sell_multipliers):.4f}')
+        print(f'Using full tariff schedules with {len(buy_multipliers)} timestep multipliers')
+        print(f'Effective buy_multipliers sample={[round(m,4) for m in buy_multipliers[:min(8, len(buy_multipliers))]]}')
+        print(f'Effective sell_multipliers sample={[round(m,4) for m in sell_multipliers[:min(8, len(sell_multipliers))]]}')
 
-        S_buy = []
-        S_sell = []
-        for t_idx in range(T_steps):
-            if t_idx < boundaries[0]:
-                period = 0
-            elif t_idx < boundaries[1]:
-                period = 1
-            else:
-                period = 2
-            S_buy.append(buy_multipliers[period] * P[t_idx])
-            S_sell.append(sell_multipliers[period] * P[t_idx])
+        S_buy = [buy_multipliers[t_idx] * P[t_idx] for t_idx in range(T_steps)]
+        S_sell = [sell_multipliers[t_idx] * P[t_idx] for t_idx in range(T_steps)]
 
     avg_S_buy  = sum(S_buy)  / len(S_buy)
     avg_S_sell = sum(S_sell) / len(S_sell)
+
+    print(f'Final S_buy sample={[round(v, 6) for v in S_buy[:min(12, len(S_buy))]]}')
+    print(f'Final S_sell sample={[round(v, 6) for v in S_sell[:min(12, len(S_sell))]]}')
+    print(f'Final S_buy avg={avg_S_buy:.6f}, min={min(S_buy):.6f}, max={max(S_buy):.6f}')
+    print(f'Final S_sell avg={avg_S_sell:.6f}, min={min(S_sell):.6f}, max={max(S_sell):.6f}')
 
     # ── Bus / charger parameters ────────────────────────────────────────────
     C_bat = pd.to_numeric(data['Buses']['Bus (kWh)'], errors='coerce').tolist()[:k_count]
