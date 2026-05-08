@@ -4,10 +4,10 @@ import os
 import threading
 import traceback
 import uuid
+
 import pandas as pd
 import pyomo.environ as pyo
 
-# This is a mock implementation of a real-time optimization endpoint for electric bus fleet scheduling.
 
 app = Flask(__name__)
 
@@ -480,12 +480,16 @@ def build_rt_context(data, payload_price_guidance, current_timestep, disturbance
         end = min(full_horizon_steps, max(start + 1, end_raw + delay_steps))
 
         state_row = trip_state_map.get(trip_id, {})
+        derived_remaining_active = max(0, end - max(start, current_timestep))
         if state_row:
-            remaining_active = safe_int(state_row.get("remaining_active_timesteps"), max(0, end - current_timestep + 1))
+            remaining_active = safe_int(
+                state_row.get("remaining_active_timesteps"),
+                derived_remaining_active,
+            )
             remaining_energy_need = safe_float(state_row.get("remaining_energy_need"), 0.0)
             interruption_allowed = parse_bool(state_row.get("interruption_allowed", True), True)
         else:
-            remaining_active = max(0, end - max(start, current_timestep) + 1)
+            remaining_active = derived_remaining_active
             remaining_energy_need = None
             interruption_allowed = True
 
@@ -598,14 +602,16 @@ def solve_rt_rescheduling(ctx):
     model.w_sell = pyo.Var(model.T, domain=pyo.NonNegativeReals)
     model.u = pyo.Var(model.I, model.T, domain=pyo.Binary)
     model.switch = pyo.Var(model.K, model.I, model.T, domain=pyo.Binary)
+    model.soc_shortfall = pyo.Var(model.K, model.T, domain=pyo.NonNegativeReals)
 
     model.constraints = pyo.ConstraintList()
 
     service_penalty = 1e5
-    dry_run_penalty = 5e4
-    switch_penalty = 50.0
-    interruption_penalty = 2e3
-    active_break_penalty = 1e4
+    interruption_penalty = 5e3
+    active_break_penalty = 5e4
+    switch_penalty = 25.0
+    soc_shortfall_penalty = 8e3
+    same_bus_break_penalty = 2e4
     site_cap = sum(charger["alpha"] for charger in chargers)
     e_min_fraction = 0.2
     e_max_fraction = 1.0
@@ -665,7 +671,9 @@ def solve_rt_rescheduling(ctx):
                 model.constraints.add(
                     model.e[k, t] == model.e[k, t - 1] + charge_in - discharge_out - trip_draw
                 )
-            model.constraints.add(model.e[k, t] >= e_min_fraction * cap)
+            model.constraints.add(
+                model.e[k, t] + model.soc_shortfall[k, t] >= e_min_fraction * cap
+            )
             model.constraints.add(model.e[k, t] <= e_max_fraction * cap)
         model.constraints.add(model.e[k, T] >= e_end_fraction * cap)
 
@@ -704,42 +712,73 @@ def solve_rt_rescheduling(ctx):
     total_buy_cost = sum(model.p_buy[t] * model.w_buy[t] for t in model.T)
     total_sell_revenue = sum(model.p_sell[t] * model.w_sell[t] for t in model.T)
     total_unserved = sum(model.u[i, t] for i in model.I for t in active_trip_steps[i])
+    weighted_unserved = sum(
+        (T - t + 1) * model.u[i, t]
+        for i in model.I
+        for t in active_trip_steps[i]
+    )
     total_switching = sum(model.switch[k, i, t] for k in model.K for i in model.I for t in model.T)
     active_breaks = sum(
         model.u[i, 1]
         for i in model.I
         if trip_by_id[i]["active_now"]
     )
+    total_soc_shortfall = sum(model.soc_shortfall[k, t] for k in model.K for t in model.T)
+    same_bus_breaks = sum(
+        1 - model.s[initial_active_bus[i], i, 1]
+        for i in model.I
+        if trip_by_id[i]["active_now"] and initial_active_bus.get(i) in K
+    )
 
     model.obj = pyo.Objective(
-        expr=service_penalty * total_unserved
+        expr=service_penalty * weighted_unserved
         + interruption_penalty * total_unserved
         + active_break_penalty * active_breaks
+        + same_bus_break_penalty * same_bus_breaks
         + switch_penalty * total_switching
-        + dry_run_penalty * 0
+        + soc_shortfall_penalty * total_soc_shortfall
         + total_buy_cost
         - total_sell_revenue,
         sense=pyo.minimize,
     )
 
     solver = None
+    solver_name_used = None
     for solver_name in ("gurobi", "appsi_highs", "highs", "cbc", "glpk"):
         try:
             candidate = pyo.SolverFactory(solver_name)
             if candidate is not None and candidate.available(False):
                 solver = candidate
+                solver_name_used = solver_name
                 break
         except Exception:
             continue
     if solver is None:
         raise RuntimeError("No supported MILP solver available for app_rt.py")
 
+    try:
+        if solver_name_used == "gurobi":
+            solver.options["TimeLimit"] = 60
+            solver.options["MIPGap"] = 0.02
+        elif solver_name_used in {"appsi_highs", "highs"}:
+            solver.options["time_limit"] = 60
+            solver.options["mip_rel_gap"] = 0.02
+        elif solver_name_used == "cbc":
+            solver.options["seconds"] = 60
+            solver.options["ratio"] = 0.02
+        elif solver_name_used == "glpk":
+            solver.options["tmlim"] = 60
+    except Exception:
+        pass
+
     solved = solver.solve(model, tee=False)
     term = str(solved.solver.termination_condition).lower()
     status = str(solved.solver.status).lower()
-    if "optimal" not in term and "feasible" not in term:
-        return None, {"solver_status": f"{status}/{term}"}
-    return model, {"solver_status": f"{status}/{term}"}
+    has_incumbent = any(model.e[k, 1].value is not None for k in K)
+    if "optimal" in term or "feasible" in term or has_incumbent:
+        suffix = "/incumbent" if has_incumbent and "optimal" not in term and "feasible" not in term else ""
+        return model, {"solver_status": f"{status}/{term}{suffix}"}
+    return None, {"solver_status": f"{status}/{term}"}
 
 
 def extract_time_series_results(model, ctx):
@@ -820,6 +859,10 @@ def extract_time_series_results(model, ctx):
         "energy": energy,
         "w_buy": w_buy,
         "w_sell": w_sell,
+        "soc_shortfall": [
+            [float(pyo.value(model.soc_shortfall[k, t])) for t in range(1, T + 1)]
+            for k in K
+        ],
         "trip_assignment_by_timestep": trip_assignment_by_timestep,
         "trip_coverage_by_timestep": trip_coverage_by_timestep,
         "temporarily_unserved_trip_ids": sorted(temporarily_unserved),
@@ -931,6 +974,7 @@ def run_optimization(
             "w_buy": series["w_buy"],
             "w_sell": series["w_sell"],
             "energy": series["energy"],
+            "soc_shortfall": series["soc_shortfall"],
             "trip_assignment_by_timestep": series["trip_assignment_by_timestep"],
             "trip_coverage_by_timestep": series["trip_coverage_by_timestep"],
             "temporarily_unserved_trip_ids": series["temporarily_unserved_trip_ids"],
@@ -939,7 +983,12 @@ def run_optimization(
             "reassignment_mapping": series["reassignment_mapping"],
             "service_unmet_count": len(series["temporarily_unserved_trip_ids"]),
             "service_unmet_duration": total_unserved_duration,
-            "soc_violation_count": 0,
+            "soc_violation_count": sum(
+                1
+                for bus_shortfall in series["soc_shortfall"]
+                for shortfall in bus_shortfall
+                if shortfall > 1e-6
+            ),
             "availability_conflicts": [],
             "solver_status": solve_meta.get("solver_status"),
             "remaining_horizon_start": ctx["current_timestep"],
